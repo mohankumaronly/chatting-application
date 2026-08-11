@@ -1,0 +1,66 @@
+/* src/index.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Light Theme */
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+  }
+
+  /* Dark Theme */
+  .dark {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+  }
+}
+
+@layer base {
+  body {
+    @apply bg-[#ECE5DD] dark:bg-[#0B141A] text-gray-900 dark:text-[#E9EDEF];
+  }
+}
+
+/* Custom WhatsApp Styles */
+@layer components {
+  .chat-header {
+    @apply bg-[#075E54] text-white 
+           dark:bg-[#1F2C33] dark:text-[#E9EDEF]
+           border-b border-gray-200 dark:border-[#222D34];
+  }
+  
+  .sidebar {
+    @apply bg-white dark:bg-[#1F2C33]
+           border-r border-gray-200 dark:border-[#222D34];
+  }
+  
+  .message-sent {
+    @apply bg-[#DCF8C6] dark:bg-[#005C4B]
+           text-gray-800 dark:text-[#E9EDEF]
+           rounded-l-2xl rounded-tr-2xl;
+  }
+  
+  .message-received {
+    @apply bg-white dark:bg-[#1F2C33]
+           text-gray-800 dark:text-[#E9EDEF]
+           rounded-r-2xl rounded-tl-2xl;
+  }
+  
+  .chat-input {
+    @apply bg-white dark:bg-[#2A3942]
+           border-t border-gray-200 dark:border-[#222D34];
+  }
+  
+  .search-bar {
+    @apply bg-gray-100 dark:bg-[#2A3942]
+           text-gray-900 dark:text-[#E9EDEF]
+           placeholder-gray-500 dark:placeholder-[#8696A0];
+  }
+  
+  .contact-item {
+    @apply hover:bg-gray-100 dark:hover:bg-[#2A3942]
+           transition-colors duration-200;
+  }
+}
