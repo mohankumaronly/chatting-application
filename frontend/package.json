@@ -10,8 +10,21 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@heroicons/react": "^2.2.0",
+    "@hookform/resolvers": "^5.7.1",
+    "@types/react-router-dom": "^5.3.3",
+    "framer-motion": "^13.1.0",
+    "lottie-web": "^5.13.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "react-dropzone": "^20.1.0",
+    "react-hook-form": "^7.85.0",
+    "react-hot-toast": "^2.6.0",
+    "react-intersection-observer": "^11.0.0",
+    "react-lottie-player": "^2.1.0",
+    "react-phone-number-input": "^3.4.17",
+    "react-router-dom": "^7.18.2",
+    "yup": "^1.7.1"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

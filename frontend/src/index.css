@@ -4,63 +4,370 @@
 @tailwind utilities;
 
 @layer base {
-  /* Light Theme */
+  /* Light Theme Variables */
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    /* Backgrounds */
+    --background: 248 248 250;
+    --foreground: 15 15 15;
+    
+    /* Primary Colors - Blue Theme */
+    --primary: 41 128 235;
+    --primary-dark: 29 78 216;
+    --primary-light: 235 245 255;
+    --primary-foreground: 255 255 255;
+    
+    /* Secondary */
+    --secondary: 241 243 245;
+    --secondary-foreground: 15 15 15;
+    
+    /* UI Elements */
+    --card: 255 255 255;
+    --card-foreground: 15 15 15;
+    
+    /* Muted */
+    --muted: 241 243 245;
+    --muted-foreground: 107 114 128;
+    
+    /* Accent */
+    --accent: 241 243 245;
+    --accent-foreground: 15 15 15;
+    
+    /* Status */
+    --destructive: 220 38 38;
+    --destructive-foreground: 255 255 255;
+    --success: 34 197 94;
+    --success-foreground: 255 255 255;
+    
+    /* Borders & Inputs */
+    --border: 229 231 235;
+    --input: 229 231 235;
+    --ring: 41 128 235;
+    
+    /* Radius */
+    --radius: 0.75rem;
+    
+    /* Custom Colors - Light Theme */
+    --app-bg: #F0F2F5;
+    --app-header: #FFFFFF;
+    --app-card: #FFFFFF;
+    --app-input: #F0F2F5;
+    --app-border: #E4E6EB;
+    --app-text-primary: #050505;
+    --app-text-secondary: #65676B;
+    --app-text-muted: #8A8D91;
+    --app-hover: #F0F2F5;
+    --app-shadow: rgba(0, 0, 0, 0.05);
+    
+    /* Message Bubbles */
+    --message-sent: #0084FF;
+    --message-sent-text: #FFFFFF;
+    --message-received: #FFFFFF;
+    --message-received-text: #050505;
+    --message-time: #8A8D91;
   }
 
-  /* Dark Theme */
+  /* Dark Theme Variables */
   .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
+    /* Backgrounds */
+    --background: 24 25 26;
+    --foreground: 228 230 235;
+    
+    /* Primary Colors - Blue Theme (brighter for dark) */
+    --primary: 55 145 255;
+    --primary-dark: 41 128 235;
+    --primary-light: 30 58 95;
+    --primary-foreground: 255 255 255;
+    
+    /* Secondary */
+    --secondary: 58 59 60;
+    --secondary-foreground: 228 230 235;
+    
+    /* UI Elements */
+    --card: 36 37 38;
+    --card-foreground: 228 230 235;
+    
+    /* Muted */
+    --muted: 58 59 60;
+    --muted-foreground: 176 179 184;
+    
+    /* Accent */
+    --accent: 58 59 60;
+    --accent-foreground: 228 230 235;
+    
+    /* Status */
+    --destructive: 220 38 38;
+    --destructive-foreground: 255 255 255;
+    --success: 34 197 94;
+    --success-foreground: 255 255 255;
+    
+    /* Borders & Inputs */
+    --border: 62 64 66;
+    --input: 62 64 66;
+    --ring: 55 145 255;
+    
+    /* Custom Colors - Dark Theme */
+    --app-bg: #18191A;
+    --app-header: #242526;
+    --app-card: #242526;
+    --app-input: #3A3B3C;
+    --app-border: #3E4042;
+    --app-text-primary: #E4E6EB;
+    --app-text-secondary: #B0B3B8;
+    --app-text-muted: #8A8D91;
+    --app-hover: #3A3B3C;
+    --app-shadow: rgba(0, 0, 0, 0.3);
+    
+    /* Message Bubbles */
+    --message-sent: #0084FF;
+    --message-sent-text: #FFFFFF;
+    --message-received: #3A3B3C;
+    --message-received-text: #E4E6EB;
+    --message-time: #8A8D91;
   }
 }
 
 @layer base {
+  * {
+    border-color: rgb(var(--border));
+  }
+  
   body {
-    @apply bg-[#ECE5DD] dark:bg-[#0B141A] text-gray-900 dark:text-[#E9EDEF];
+    background-color: rgb(var(--background));
+    color: rgb(var(--foreground));
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 }
 
-/* Custom WhatsApp Styles */
+/* Custom Component Classes */
 @layer components {
-  .chat-header {
-    @apply bg-[#075E54] text-white 
-           dark:bg-[#1F2C33] dark:text-[#E9EDEF]
-           border-b border-gray-200 dark:border-[#222D34];
+  /* App Layout */
+  .app-container {
+    @apply min-h-screen;
+    background-color: var(--app-bg);
+    color: var(--app-text-primary);
   }
   
+  .app-header {
+    background-color: var(--app-header);
+    border-bottom: 1px solid var(--app-border);
+    color: var(--app-text-primary);
+  }
+  
+  .app-card {
+    background-color: var(--app-card);
+    color: var(--app-text-primary);
+    border-radius: 0.75rem;
+    box-shadow: 0 1px 3px var(--app-shadow);
+  }
+  
+  /* Sidebar */
   .sidebar {
-    @apply bg-white dark:bg-[#1F2C33]
-           border-r border-gray-200 dark:border-[#222D34];
+    background-color: var(--app-card);
+    border-right: 1px solid var(--app-border);
+    color: var(--app-text-primary);
   }
   
+  /* Chat Window */
+  .chat-window {
+    background-color: var(--app-bg);
+  }
+  
+  /* Message Bubbles */
   .message-sent {
-    @apply bg-[#DCF8C6] dark:bg-[#005C4B]
-           text-gray-800 dark:text-[#E9EDEF]
-           rounded-l-2xl rounded-tr-2xl;
+    background-color: var(--message-sent);
+    color: var(--message-sent-text);
+    border-radius: 1.25rem 1.25rem 0.25rem 1.25rem;
   }
   
   .message-received {
-    @apply bg-white dark:bg-[#1F2C33]
-           text-gray-800 dark:text-[#E9EDEF]
-           rounded-r-2xl rounded-tl-2xl;
+    background-color: var(--message-received);
+    color: var(--message-received-text);
+    border-radius: 1.25rem 1.25rem 1.25rem 0.25rem;
   }
   
-  .chat-input {
-    @apply bg-white dark:bg-[#2A3942]
-           border-t border-gray-200 dark:border-[#222D34];
+  .message-time {
+    color: var(--message-time);
+    font-size: 0.6875rem;
   }
   
+  /* Inputs */
+  .app-input {
+    background-color: var(--app-input);
+    border: 1px solid var(--app-border);
+    color: var(--app-text-primary);
+    placeholder-color: var(--app-text-secondary);
+  }
+  
+  .app-input::placeholder {
+    color: var(--app-text-secondary);
+  }
+  
+  .app-input:focus {
+    outline: none;
+    ring: 2px solid rgb(var(--ring));
+    border-color: transparent;
+  }
+  
+  /* Buttons */
+  .btn-primary {
+    background-color: rgb(var(--primary));
+    color: rgb(var(--primary-foreground));
+    transition: all 0.2s;
+  }
+  
+  .btn-primary:hover {
+    background-color: rgb(var(--primary-dark));
+    transform: scale(1.02);
+  }
+  
+  .btn-outline {
+    border: 1px solid var(--app-border);
+    color: var(--app-text-primary);
+    transition: all 0.2s;
+  }
+  
+  .btn-outline:hover {
+    background-color: var(--app-hover);
+  }
+  
+  /* Text Colors */
+  .text-primary-custom {
+    color: var(--app-text-primary);
+  }
+  
+  .text-secondary-custom {
+    color: var(--app-text-secondary);
+  }
+  
+  .text-muted-custom {
+    color: var(--app-text-muted);
+  }
+  
+  /* Hover States */
+  .hover-bg {
+    transition: background-color 0.2s;
+  }
+  
+  .hover-bg:hover {
+    background-color: var(--app-hover);
+  }
+  
+  /* Search Bar */
   .search-bar {
-    @apply bg-gray-100 dark:bg-[#2A3942]
-           text-gray-900 dark:text-[#E9EDEF]
-           placeholder-gray-500 dark:placeholder-[#8696A0];
+    background-color: var(--app-input);
+    color: var(--app-text-primary);
+    placeholder-color: var(--app-text-secondary);
   }
   
+  .search-bar::placeholder {
+    color: var(--app-text-secondary);
+  }
+  
+  .search-bar:focus {
+    outline: none;
+    ring: 2px solid rgb(var(--ring));
+    border-color: transparent;
+  }
+  
+  /* Chat Header */
+  .chat-header {
+    background-color: var(--app-header);
+    border-bottom: 1px solid var(--app-border);
+    color: var(--app-text-primary);
+  }
+  
+  /* Contact Item */
   .contact-item {
-    @apply hover:bg-gray-100 dark:hover:bg-[#2A3942]
-           transition-colors duration-200;
+    transition: background-color 0.2s;
+  }
+  
+  .contact-item:hover {
+    background-color: var(--app-hover);
+  }
+  
+  /* Chat Input */
+  .chat-input {
+    background-color: var(--app-card);
+    border-top: 1px solid var(--app-border);
+  }
+  
+  /* Theme Toggle */
+  .theme-toggle {
+    padding: 0.5rem;
+    border-radius: 9999px;
+    transition: background-color 0.2s;
+  }
+  
+  .theme-toggle:hover {
+    background-color: var(--app-hover);
+  }
+  
+  /* Nav Links */
+  .nav-link {
+    color: var(--app-text-secondary);
+    transition: color 0.2s;
+  }
+  
+  .nav-link:hover {
+    color: var(--app-text-primary);
+  }
+  
+  /* Feature Cards */
+  .feature-card {
+    background-color: var(--app-card);
+    border: 1px solid var(--app-border);
+    color: var(--app-text-primary);
+    transition: all 0.3s;
+  }
+  
+  .feature-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 10px 40px var(--app-shadow);
+  }
+}
+
+/* Animation Utilities */
+@layer utilities {
+  .animate-fade-in {
+    animation: fadeIn 0.5s ease-in-out;
+  }
+  
+  .animate-slide-up {
+    animation: slideUp 0.5s ease-out;
+  }
+  
+  .animate-pulse-slow {
+    animation: pulseSlow 2s ease-in-out infinite;
+  }
+  
+  @keyframes fadeIn {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  
+  @keyframes slideUp {
+    from {
+      transform: translateY(20px);
+      opacity: 0;
+    }
+    to {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  }
+  
+  @keyframes pulseSlow {
+    0%, 100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.5;
+    }
   }
 }
