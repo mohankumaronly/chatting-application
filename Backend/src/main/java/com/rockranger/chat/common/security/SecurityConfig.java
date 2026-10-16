@@ -54,6 +54,7 @@ public class SecurityConfig {
                                 "/api/v1/username/available",
                                 "/oauth2/**",
                                 "/login/oauth2/**",
+                                "/ws/**",
                                 "/error"
                         ).permitAll()
                         .anyRequest().authenticated()

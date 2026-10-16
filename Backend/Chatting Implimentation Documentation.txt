@@ -1,0 +1,2353 @@
+# Phase 2: Chat & Messaging Module — Complete Implementation Specification
+
+**Backend architecture and implementation specification · Java 21 · Spring Boot · PostgreSQL · Redis · Spring Security · WebSocket/STOMP · Cloudinary**
+
+This document is the **complete, self-contained blueprint** for building the chat and messaging module (Phase 2) of your WhatsApp-like chatting application. It builds directly on top of the authentication, profile, block, and account-deletion system defined in Phase 1 (`com.rockranger.chat`), and it assumes the following are already in place:
+
+- `auth` module — registration, login, refresh, logout, password recovery
+- `profile` module — username, bio, avatar
+- `block` module — directional user blocking
+- `account` module — deletion request, recovery, tombstones
+- `session` module — refresh-token rotation, device sessions
+- `common.security` — JWT access tokens, current-user principal
+- `notification` — Brevo transactional emails
+- Flyway migrations through `V12__add_avatar_url_to_user_profiles.sql`
+
+> **Nothing in Phase 1 changes.** Phase 2 is a **separate business module inside the same Spring Boot application** — not a microservice.
+
+---
+
+## Table of Contents
+
+1. How Phase 2 fits into your project
+2. Core architectural rules
+3. Phase 2 scope — what you are building
+4. Recommended package structure
+5. How the modules interact
+6. Product rules to define before coding
+7. Database design and relationships
+8. Flyway migration sequence
+9. REST API specification
+10. Real-time messaging architecture (WebSocket + STOMP)
+11. Message lifecycle and WhatsApp-like interactions
+12. Sent, delivered, read, and unread behaviour
+13. Online presence, last seen, and typing indicators
+14. Media sharing with Cloudinary
+15. Blocking and account-lifecycle integration
+16. Security requirements for the messaging module
+17. The end-to-end encryption decision
+18. React frontend integration
+19. Performance and scaling
+20. Testing strategy
+21. Implementation roadmap
+22. Phase 2 acceptance checklist
+
+---
+
+# 1. How Phase 2 fits into your project
+
+Your current backend uses Java and Spring Boot with a modular package structure under `com.rockranger.chat`. Your existing tree contains modules for `auth`, `user`, `profile`, `session`, `identity`, `block`, `account`, `notification`, `verification`, and shared `security`/`configuration`. It also has Flyway migrations through `V12`.
+
+**Phase 2 should be a separate business module inside the same Spring Boot application — not a separate microservice at this stage.**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│           React Web  /  Future Mobile Apps                       │
+│   Chat UI · Message list · Attachments · Notifications           │
+└─────────────────────────────────────────────────────────────────┘
+                             │
+                    HTTPS REST + WebSocket over WSS
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Existing Spring Boot Backend                        │
+│                                                                  │
+│  Existing modules               Phase 2 modules                  │
+│  ─────────────────              ─────────────────                │
+│  Auth                           Conversation                     │
+│  Profile                        Messaging                        │
+│  Block                          Receipts                         │
+│  Session                        Presence                         │
+│  Account                        Attachments                      │
+│  Identity                       Realtime                         │
+│  Verification                   Reaction                         │
+│  Notification                                                    │
+│  common.security                                                 │
+└─────────────────────────────────────────────────────────────────┘
+       │                │                │
+       ▼                ▼                ▼
+  ┌─────────┐     ┌─────────┐      ┌──────────────┐
+  │PostgreSQL│     │  Redis  │      │  Cloudinary  │
+  │ messages │     │ presence│      │  images      │
+  │ convos   │     │ typing  │      │  videos      │
+  │ receipts │     │ rate    │      │  pdfs        │
+  │ reactions│     │ limits  │      │  audio       │
+  └─────────┘     └─────────┘      └──────────────┘
+```
+
+**Why a modular monolith, not microservices:**
+
+- A single JVM can handle the initial load.
+- Transactions across modules (message + conversation summary + outbox) stay simple.
+- Refactoring boundaries are easier before distribution.
+- You can split modules into independent services later if scale justifies it.
+
+---
+
+# 2. Core architectural rules
+
+These rules apply to **every** module in Phase 2:
+
+1. **PostgreSQL is the source of truth** for conversations, messages, membership, reactions, receipts, and user-specific chat settings.
+2. **Redis is temporary/shared coordination storage** for online presence, typing indicators, rate limits, and — if needed — cross-instance event coordination.
+3. **WebSocket delivers live events, but it is not the permanent message store.**
+4. **REST APIs support loading, pagination, recovery, and management operations.**
+5. **Cloudinary holds media bytes; PostgreSQL stores attachment metadata and references.**
+6. **Your existing security layer authenticates users.** Messaging endpoints must derive the sender from the **authenticated principal**, never trust a client-provided `senderId`.
+7. **Every REST endpoint, WebSocket command, subscription, and media download is a separate authorization boundary.**
+8. **Block and account-status policies apply to messaging.** A blocked user cannot send new messages; a `PENDING_DELETION` user cannot participate.
+9. **Idempotency is mandatory** for message sending. Duplicate `clientMessageId` must not create duplicate messages.
+10. **Sequence numbers are server-assigned** and are the stable ordering for history.
+11. **The outbox pattern is used** so committed messages are never lost if the WebSocket publisher crashes.
+12. **Entities are never broadcast directly.** Use DTOs.
+
+---
+
+# 3. Phase 2 scope — what you are building
+
+## 3.1 Feature areas
+
+| Feature area | Required behaviour |
+|---|---|
+| **User discovery** | Search public usernames and view allowed profile details |
+| **Direct conversations** | Start or reuse a conversation with another user |
+| **Chat list** | List, archive, unarchive, pin, mute, hide, and remove chats for yourself |
+| **Text messaging** | Send, persist, retrieve, edit, and delete messages |
+| **Real-time delivery** | Deliver messages and updates over WebSocket |
+| **Message interaction** | Reply, react, copy, forward later, and manage message state |
+| **Delivery indicators** | Sent, delivered, and read states, subject to privacy settings |
+| **Presence** | Online/offline, last seen, and typing indicators |
+| **Media** | Images, GIFs, videos, documents/PDFs, audio, and later voice notes |
+| **Reliability** | Pagination, idempotency, reconnect, retries, and missed-event recovery |
+| **Safety** | Blocking, authorization, upload limits, spam prevention, and auditability |
+| **Notifications** | In-app updates first; push notifications for offline mobile/web clients later |
+
+## 3.2 Scope boundary
+
+This is the **core messaging module**, not the entire WhatsApp feature set.
+
+**Out of scope (separate planned features):**
+- Group chats (schema is designed to allow them later)
+- Voice/video calls
+- Stories/status
+- Channels
+- Contact synchronization
+- Multi-device end-to-end encryption
+- Advanced backups
+
+Do not implement these unless you explicitly bring them into scope.
+
+---
+
+# 4. Recommended package structure
+
+Follow the same layered approach already used by your project: `api`, `application`, `domain`, and DTOs. Keep controllers thin, put business rules in services, and keep database entities and repositories within their owning modules.
+
+Add the following packages beneath `src/main/java/com/rockranger/chat/`:
+
+```
+conversation/
+├── api/
+│   ├── ConversationController.java
+│   ├── ConversationMemberController.java
+│   └── ChatListController.java
+├── application/
+│   ├── ConversationService.java
+│   ├── DirectConversationService.java
+│   ├── ConversationMembershipService.java
+│   ├── ChatListService.java
+│   └── ConversationAuthorizationService.java
+├── domain/
+│   ├── Conversation.java
+│   ├── ConversationMember.java
+│   ├── ConversationType.java
+│   ├── ConversationMemberRole.java
+│   ├── ConversationRepository.java
+│   └── ConversationMemberRepository.java
+└── dto/
+    ├── CreateDirectConversationRequest.java
+    ├── ConversationResponse.java
+    ├── ConversationSummaryResponse.java
+    ├── ChatListItemResponse.java
+    └── UpdateConversationSettingsRequest.java
+
+messaging/
+├── api/
+│   └── MessageController.java
+├── application/
+│   ├── MessageService.java
+│   ├── MessageQueryService.java
+│   ├── MessageEditService.java
+│   ├── MessageDeletionService.java
+│   └── MessageAuthorizationService.java
+├── domain/
+│   ├── Message.java
+│   ├── MessageType.java
+│   ├── MessageStatus.java
+│   ├── MessageRepository.java
+│   └── MessageSequenceService.java
+└── dto/
+    ├── SendMessageRequest.java
+    ├── EditMessageRequest.java
+    ├── MessageResponse.java
+    ├── MessagePageResponse.java
+    └── DeleteMessageRequest.java
+
+realtime/
+├── config/
+│   ├── WebSocketConfig.java
+│   └── WebSocketSecurityConfig.java
+├── api/
+│   └── RealtimeEventController.java
+├── application/
+│   ├── RealtimePublisher.java
+│   ├── RealtimeEventService.java
+│   └── EventReplayService.java
+├── domain/
+│   └── RealtimeEvent.java
+└── dto/
+    ├── ClientCommand.java
+    ├── ServerEvent.java
+    └── RealtimeError.java
+
+receipt/
+├── api/
+│   └── ReceiptController.java
+├── application/
+│   ├── DeliveryReceiptService.java
+│   └── ReadReceiptService.java
+├── domain/
+│   ├── MessageReceipt.java
+│   └── MessageReceiptRepository.java
+└── dto/
+    ├── DeliveredReceiptRequest.java
+    └── ReadReceiptRequest.java
+
+reaction/
+├── api/
+│   └── ReactionController.java
+├── application/
+│   ├── ReactionService.java
+│   └── ReactionPolicy.java
+├── domain/
+│   ├── MessageReaction.java
+│   └── MessageReactionRepository.java
+└── dto/
+    └── ReactionRequest.java
+
+presence/
+├── api/
+│   └── PresenceController.java
+├── application/
+│   ├── PresenceService.java
+│   ├── TypingService.java
+│   └── PresencePrivacyService.java
+├── infrastructure/
+│   └── RedisPresenceStore.java
+└── dto/
+    ├── PresenceResponse.java
+    └── TypingEventRequest.java
+
+attachment/
+├── api/
+│   └── AttachmentController.java
+├── application/
+│   ├── AttachmentService.java
+│   ├── UploadAuthorizationService.java
+│   └── AttachmentValidationService.java
+├── domain/
+│   ├── Attachment.java
+│   ├── AttachmentType.java
+│   └── AttachmentRepository.java
+├── infrastructure/
+│   └── ObjectStorageService.java     ← Cloudinary adapter
+└── dto/
+    ├── UploadIntentRequest.java
+    ├── UploadIntentResponse.java
+    ├── CompleteUploadRequest.java
+    └── AttachmentResponse.java
+```
+
+You do **not** have to create every class on day one. Create a package when you start its feature. The structure above is the target organization.
+
+---
+
+# 5. How the modules interact
+
+| Module | Owns |
+|---|---|
+| `conversation` | Conversation identity and membership |
+| `messaging` | Message creation, edits, deletion, and history |
+| `realtime` | Event distribution after business operations succeed |
+| `receipt` | Delivered/read state |
+| `reaction` | Reactions |
+| `presence` | Ephemeral online and typing information |
+| `attachment` | Upload authorization, validation, and metadata |
+| `profile` (existing) | Public profile information |
+| `block` (existing) | Block rules |
+| `session` + `common.security` (existing) | Identity and session validation |
+| `account` (existing) | Deletion state, tombstones |
+
+**Avoid having controllers call repositories from other modules directly.** Expose service methods and domain-level operations instead.
+
+**Interface examples:**
+
+```java
+// Consumed by messaging and realtime
+public interface BlockPolicy {
+    boolean isBlocked(UUID userId, UUID otherUserId);
+    boolean hasAnyBlock(UUID userId, UUID otherUserId);
+    Set<UUID> filterBlocked(Set<UUID> candidateIds, UUID viewerId);
+}
+
+// Consumed by messaging
+public interface AccountStatusPolicy {
+    boolean canSendMessages(UUID userId);
+    boolean canReceiveMessages(UUID userId);
+    boolean canAuthenticate(UUID userId);
+}
+
+// Consumed by attachment
+public interface ObjectStorageService {
+    UploadIntent createUploadIntent(String filename, String mimeType, long sizeBytes, UUID ownerId);
+    AttachmentMetadata verifyUpload(String storageKey, UUID ownerId);
+    String createSignedDownloadUrl(String storageKey, Duration ttl);
+    void deleteAsset(String storageKey);
+}
+```
+
+---
+
+# 6. Product rules to define before coding
+
+These rules prevent subtle inconsistencies between REST, WebSocket, and the UI.
+
+## 6.1 User search does not create a chat
+
+**Example workflow:**
+
+1. User A searches for `@mohan`.
+2. Backend returns only discoverable users.
+3. User A opens the profile.
+4. **No conversation is created** merely by searching or viewing.
+5. User A presses **Message**.
+6. The client requests a direct conversation.
+7. The backend **reuses the existing direct conversation** if one exists; otherwise it creates one.
+8. User A sends the first message.
+9. The message is persisted and appears in the chat list.
+
+Use a **database uniqueness strategy** to prevent two simultaneous requests from creating duplicate direct conversations.
+
+## 6.2 A conversation is not the same as a chat-list item
+
+A **conversation** represents the shared communication thread. Each user's **chat-list settings are separate**.
+
+For example:
+
+- A archives a chat. **B must not have their chat archived** by that action.
+- A mutes a chat. **B's notification preferences remain unchanged.**
+- A removes a chat from their list. **B can still see their own conversation history.**
+
+Therefore, **do not put fields such as `is_archived`, `is_muted`, or `is_pinned` on the shared `conversations` row.** Put them in a **per-user conversation state table** (`conversation_user_state`).
+
+## 6.3 Choose explicit semantics for hide, archive, and delete
+
+These actions should **not** be interchangeable.
+
+| Action | Meaning |
+|---|---|
+| **Archive** | Remove from the main list but preserve the conversation |
+| **Unarchive** | Return it to the main list |
+| **Pin** | Keep the chat near the top of the list |
+| **Mute** | Suppress selected notifications for that user |
+| **Mark unread** | Set the user's unread indicator without deleting messages |
+| **Hide / remove for me** | Remove it from that user's normal chat view according to the chosen retention policy |
+| **Delete for everyone** | Delete or tombstone a specific message for all authorized participants, subject to product rules |
+
+> **Important decision:** decide whether an archived chat returns to the main list when a new message arrives. A WhatsApp-like option can be implemented as a **user setting**. Do not hard-code one global rule for every user.
+
+## 6.4 Define message delivery states
+
+Do not treat "sent", "delivered", and "read" as the same event.
+
+- **Sent:** the server has accepted and durably stored the message.
+- **Delivered:** the recipient's client has acknowledged receiving the message, according to your delivery definition.
+- **Read:** the recipient has explicitly marked the message as read under your application's read-receipt rules.
+
+> A WebSocket broadcast attempt does **not** prove delivery. A successful network write does **not** prove that a recipient has displayed the message.
+
+## 6.5 Choose a delete-for-everyone policy
+
+Decide explicitly:
+
+- **Time limit:** e.g., 1 hour, 24 hours, or unlimited.
+- **Scope:** sender-only, sender + moderator, or all participants.
+- **Effect:** hard delete vs. tombstone (recommended: tombstone so ordering is preserved and clients can render "This message was deleted").
+- **Attachments:** delete the Cloudinary asset, or leave it orphaned until cleanup.
+
+## 6.6 Choose an edit policy
+
+- **Time limit:** e.g., 15 minutes, 1 hour, or unlimited.
+- **History:** retain edit history in a separate table, or store only the latest content + `edited_at`.
+- **Types:** only `TEXT` messages are editable; media captions may or may not be.
+- **Deleted messages:** cannot be edited.
+
+## 6.7 Choose a block-behaviour policy
+
+When user A blocks user B:
+
+| Question | Recommended default |
+|---|---|
+| Can A still view the historical conversation? | **Yes** |
+| Can A send new messages to B? | **No** |
+| Can B send new messages to A? | **No** |
+| Can either see the other's online status or last seen? | **No** |
+| Can either retrieve existing shared attachments? | **Yes** (historical) |
+| Can the block be reversed without recreating the conversation? | **Yes** |
+
+**Do not automatically delete all historical messages when a block is created.**
+
+## 6.8 Choose an account-deletion behaviour policy
+
+When a user requests account deletion:
+
+- **Prevent new messaging** — a `PENDING_DELETION` user cannot send or receive new messages.
+- **Decide whether existing conversations remain visible** to other participants — recommended: they remain visible but frozen.
+- **Prevent the account from bypassing restrictions through an existing WebSocket connection** — revalidate account status per command, not just at connect time.
+- **On final deletion**, apply the documented retention, identity cleanup, and message-retention policy.
+
+---
+
+# 7. Database design and relationships
+
+Your existing migrations end at `V12__add_avatar_url_to_user_profiles.sql`, so the Phase 2 schema begins with **V13** and continues upward.
+
+**Use Flyway for schema changes. Do not edit old migrations that have already run in your database.**
+
+## 7.1 `conversations`
+
+Stores the shared conversation.
+
+```sql
+CREATE TABLE conversations (
+    id UUID PRIMARY KEY,
+    type VARCHAR(20) NOT NULL,
+    created_by UUID NOT NULL REFERENCES users(id),
+    direct_pair_key VARCHAR(80),                -- see §7.1.1
+    last_message_id UUID,
+    last_message_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_conversation_type CHECK (type IN ('DIRECT', 'GROUP'))
+);
+
+-- One direct conversation per normalized pair of users
+CREATE UNIQUE INDEX uq_conversation_direct_pair
+    ON conversations(direct_pair_key)
+    WHERE type = 'DIRECT' AND direct_pair_key IS NOT NULL;
+
+CREATE INDEX idx_conversation_last_message
+    ON conversations(last_message_at DESC NULLS LAST);
+```
+
+### 7.1.1 Direct-pair uniqueness strategy
+
+A direct conversation is between two users. To enforce **one direct conversation per pair**, store a canonical `direct_pair_key`:
+
+```java
+static String directPairKey(UUID a, UUID b) {
+    return a.compareTo(b) < 0
+        ? a + ":" + b
+        : b + ":" + a;
+}
+```
+
+This key is a `String` (max 73 chars), and the partial unique index enforces the constraint **at the database level**. Two concurrent requests cannot create two direct conversations.
+
+### 7.1.2 Group-chat compatibility
+
+The `type` column already supports `GROUP`. The `direct_pair_key` is only set for `DIRECT`. When you add group chats later, you only need to add membership and role rules — the schema is ready.
+
+## 7.2 `conversation_members`
+
+Stores who belongs to the conversation.
+
+```sql
+CREATE TABLE conversation_members (
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL DEFAULT 'MEMBER',
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    left_at TIMESTAMPTZ,
+    last_read_message_id UUID,
+    last_read_at TIMESTAMPTZ,
+
+    PRIMARY KEY (conversation_id, user_id),
+    CONSTRAINT chk_member_role CHECK (role IN ('MEMBER', 'ADMIN'))
+);
+
+CREATE INDEX idx_member_user_active
+    ON conversation_members(user_id)
+    WHERE left_at IS NULL;
+```
+
+**For a direct conversation, there should normally be two active members.**
+
+**Do not accept arbitrary user IDs from a client** without checking that the caller can add those users under the conversation's rules.
+
+**Group-chat readiness:** the `role` column and `left_at` column are already present. When group chats arrive, add `invited_by`, `joined_via`, and admin-only operations.
+
+## 7.3 `conversation_user_state`
+
+Stores per-user chat-list preferences.
+
+```sql
+CREATE TABLE conversation_user_state (
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    archived_at TIMESTAMPTZ,
+    pinned_at TIMESTAMPTZ,
+    muted_until TIMESTAMPTZ,
+    hidden_at TIMESTAMPTZ,
+    unread_override BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (conversation_id, user_id)
+);
+
+CREATE INDEX idx_user_state_chat_list
+    ON conversation_user_state(user_id)
+    WHERE hidden_at IS NULL;
+```
+
+**Primary key:** `(conversation_id, user_id)`.
+
+**For "remove for me"**, decide whether to use a `hidden_at` state or a per-user **history boundary**. A history boundary can hide old messages while allowing newer ones to appear. It is different from deleting the shared conversation or deleting messages for everyone.
+
+## 7.4 `messages`
+
+Stores durable messages.
+
+```sql
+CREATE TABLE messages (
+    id UUID PRIMARY KEY,
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    sender_id UUID NOT NULL REFERENCES users(id),
+    client_message_id UUID NOT NULL,
+    sequence_number BIGINT NOT NULL,
+    message_type VARCHAR(20) NOT NULL,
+    content TEXT,
+    reply_to_message_id UUID REFERENCES messages(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    edited_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
+    delete_scope VARCHAR(20),
+    metadata JSONB,
+
+    CONSTRAINT chk_message_type CHECK (
+        message_type IN ('TEXT', 'IMAGE', 'VIDEO', 'AUDIO', 'FILE', 'GIF', 'SYSTEM')
+    ),
+    CONSTRAINT chk_delete_scope CHECK (
+        delete_scope IS NULL OR delete_scope IN ('FOR_ME', 'FOR_EVERYONE')
+    ),
+    CONSTRAINT uq_sender_client_message UNIQUE (sender_id, client_message_id),
+    CONSTRAINT uq_conversation_sequence UNIQUE (conversation_id, sequence_number)
+);
+
+CREATE INDEX idx_messages_history
+    ON messages(conversation_id, sequence_number DESC);
+
+CREATE INDEX idx_messages_sender
+    ON messages(sender_id, created_at DESC);
+```
+
+**Recommended constraints and indexes:**
+
+- Unique `(sender_id, client_message_id)` for **idempotency**.
+- Unique `(conversation_id, sequence_number)` for **stable ordering**.
+- Index `(conversation_id, sequence_number DESC)` for **history pagination**.
+- Index `(sender_id, created_at DESC)` where useful.
+- Foreign keys to the correct users and conversation.
+- Use **server time** for canonical creation and edit timestamps.
+
+> **Do not rely on client timestamps to determine the official message order.**
+
+### 7.4.1 Sequence assignment
+
+`sequence_number` is **monotonic within a conversation**. Two safe strategies:
+
+**Strategy A — PostgreSQL sequence per conversation (recommended for correctness):**
+
+- Keep a `next_sequence` column on `conversations` and increment it inside the transaction with `SELECT ... FOR UPDATE`.
+
+**Strategy B — Global sequence with `conversation_id` index:**
+
+- Simpler but harder to keep gap-free per conversation.
+
+Go with **Strategy A**.
+
+```java
+@Transactional
+public Message createMessage(...) {
+    Conversation c = conversationRepo.findByIdForUpdate(conversationId)
+        .orElseThrow(...);
+    long seq = c.nextSequence();
+    Message m = Message.builder()
+        .sequenceNumber(seq)
+        ...
+        .build();
+    messageRepo.save(m);
+    c.setLastMessageId(m.getId());
+    c.setLastMessageAt(m.getCreatedAt());
+    c.setUpdatedAt(Instant.now());
+    return m;
+}
+```
+
+## 7.5 `attachments`
+
+Stores media metadata, **not media bytes**.
+
+```sql
+CREATE TABLE attachments (
+    id UUID PRIMARY KEY,
+    owner_id UUID NOT NULL REFERENCES users(id),
+    storage_provider VARCHAR(30) NOT NULL DEFAULT 'CLOUDINARY',
+    storage_key VARCHAR(500) NOT NULL,
+    resource_type VARCHAR(30) NOT NULL,
+    mime_type VARCHAR(100) NOT NULL,
+    size_bytes BIGINT NOT NULL,
+    original_filename VARCHAR(255) NOT NULL,
+    checksum VARCHAR(128),
+    width INT,
+    height INT,
+    duration_ms INT,
+    upload_status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_upload_status CHECK (
+        upload_status IN ('PENDING', 'UPLOADED', 'READY', 'REJECTED')
+    ),
+    CONSTRAINT chk_resource_type CHECK (
+        resource_type IN ('IMAGE', 'VIDEO', 'RAW', 'AUDIO')
+    )
+);
+
+CREATE INDEX idx_attachments_owner ON attachments(owner_id, created_at DESC);
+CREATE INDEX idx_attachments_status ON attachments(upload_status)
+    WHERE upload_status IN ('PENDING', 'UPLOADED');
+```
+
+**A separate `message_attachments` table** should associate an attachment with a message. This supports multiple files per message and makes it easier to enforce access rules.
+
+```sql
+CREATE TABLE message_attachments (
+    message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    attachment_id UUID NOT NULL REFERENCES attachments(id) ON DELETE CASCADE,
+    display_order INT NOT NULL DEFAULT 0,
+
+    PRIMARY KEY (message_id, attachment_id)
+);
+
+CREATE INDEX idx_message_attachments_attachment
+    ON message_attachments(attachment_id);
+```
+
+## 7.6 `message_reactions`
+
+Stores one user's reaction to a message.
+
+```sql
+CREATE TABLE message_reactions (
+    id UUID PRIMARY KEY,
+    message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id),
+    emoji VARCHAR(16) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_reaction UNIQUE (message_id, user_id, emoji)
+);
+
+CREATE INDEX idx_reactions_message ON message_reactions(message_id);
+```
+
+Add a uniqueness constraint such as `(message_id, user_id, emoji)` if users may apply **different emoji** reactions to the same message. If the product allows **only one reaction per user per message**, use `(message_id, user_id)` instead.
+
+## 7.7 `message_receipts`
+
+For **direct chats**, a per-message receipt row can store:
+
+```sql
+CREATE TABLE message_receipts (
+    message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id),
+    delivered_at TIMESTAMPTZ,
+    read_at TIMESTAMPTZ,
+
+    PRIMARY KEY (message_id, user_id)
+);
+
+CREATE INDEX idx_receipts_unread
+    ON message_receipts(user_id)
+    WHERE read_at IS NULL;
+```
+
+For **groups**, this can grow quickly. You may eventually use **per-member read cursors** and compute read state from them rather than inserting a receipt row for every message-recipient pair. Decide based on group size and required UI detail.
+
+## 7.8 Additional tables for later features
+
+| Table | Purpose |
+|---|---|
+| `message_user_deletions` | Messages hidden by individual users (delete-for-me) |
+| `realtime_outbox` | Durable events waiting to be published |
+| `user_presence_settings` | Durable privacy preferences for last seen and read receipts |
+| `conversation_invites` | Only if you add invitation/approval workflows |
+| `attachment_access_audit` | Optional audit records for sensitive files |
+
+### 7.8.1 `realtime_outbox`
+
+```sql
+CREATE TABLE realtime_outbox (
+    id UUID PRIMARY KEY,
+    event_type VARCHAR(100) NOT NULL,
+    aggregate_type VARCHAR(50) NOT NULL,
+    aggregate_id UUID NOT NULL,
+    payload JSONB NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    attempts INT NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published_at TIMESTAMPTZ,
+
+    CONSTRAINT chk_outbox_status CHECK (
+        status IN ('PENDING', 'PUBLISHED', 'FAILED', 'DEAD_LETTER')
+    )
+);
+
+CREATE INDEX idx_realtime_outbox_pending
+    ON realtime_outbox(created_at)
+    WHERE status = 'PENDING';
+```
+
+### 7.8.2 `message_user_deletions`
+
+```sql
+CREATE TABLE message_user_deletions (
+    message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (message_id, user_id)
+);
+```
+
+### 7.8.3 `user_presence_settings`
+
+```sql
+CREATE TABLE user_presence_settings (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    last_seen_visibility VARCHAR(20) NOT NULL DEFAULT 'EVERYONE',
+    online_visibility VARCHAR(20) NOT NULL DEFAULT 'EVERYONE',
+    read_receipts_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    typing_visibility BOOLEAN NOT NULL DEFAULT TRUE,
+    profile_photo_visibility VARCHAR(20) NOT NULL DEFAULT 'EVERYONE',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_last_seen_visibility CHECK (
+        last_seen_visibility IN ('EVERYONE', 'CONTACTS', 'NOBODY')
+    )
+);
+```
+
+---
+
+# 8. Flyway migration sequence
+
+```
+V13__create_conversations.sql
+V14__create_conversation_members.sql
+V15__create_conversation_user_state.sql
+V16__create_messages.sql
+V17__create_attachments.sql
+V18__create_message_attachments.sql
+V19__create_message_reactions.sql
+V20__create_message_receipts.sql
+V21__create_message_user_deletions.sql
+V22__create_realtime_outbox.sql
+V23__create_user_presence_settings.sql
+V24__add_messaging_indexes_and_constraints.sql
+```
+
+This is a **proposed sequence**, not a requirement to create empty migrations for every item. Adjust it if you combine related tables or choose a different receipt design.
+
+**Rules:**
+
+- Never edit a migration that has already run in your database.
+- Use `ddl-auto: validate` in every environment.
+- Test migrations from a clean database **and** from a copy of the existing V12 database.
+
+---
+
+# 9. REST API specification
+
+Base path: `/api/v1`. Use your existing authentication conventions, response envelope, and error format wherever possible.
+
+## 9.1 User discovery
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/users/search?q=mohan&limit=20` | Search usernames |
+| `GET` | `/api/v1/users/{userId}/public-profile` | View allowed public profile |
+| `GET` | `/api/v1/users/username/{username}` | Resolve a username, if needed |
+
+**Search requirements:**
+
+- Require authentication unless you explicitly support public search.
+- Normalize usernames consistently with the existing username policy.
+- Return only fields allowed by profile visibility rules.
+- Use pagination or a bounded limit (max 50).
+- Rate-limit searches and avoid revealing private email addresses or phone numbers.
+- Apply blocking and account-status policies consistently.
+- **Do not create conversations as a side effect of search.**
+
+**Example response:**
+
+```json
+{
+  "items": [
+    {
+      "userId": "a52d...",
+      "username": "mohan",
+      "displayName": "Mohan Kumar",
+      "avatarUrl": "https://res.cloudinary.com/.../avatar.jpg"
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+> The URL above is illustrative. In production, generate **short-lived signed** Cloudinary URLs, not permanent public URLs, unless the asset is deliberately public.
+
+## 9.2 Conversation and chat-list APIs
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/conversations/direct` | Create or reuse a direct conversation |
+| `GET` | `/api/v1/conversations` | List conversations the caller can access |
+| `GET` | `/api/v1/conversations/{conversationId}` | Get conversation details |
+| `GET` | `/api/v1/chats` | Fetch the caller's chat list |
+| `PATCH` | `/api/v1/chats/{conversationId}/settings` | Archive, pin, or mute settings |
+| `POST` | `/api/v1/chats/{conversationId}/archive` | Archive for current user |
+| `DELETE` | `/api/v1/chats/{conversationId}/archive` | Unarchive |
+| `POST` | `/api/v1/chats/{conversationId}/hide` | Hide/remove for current user |
+| `DELETE` | `/api/v1/chats/{conversationId}/hide` | Restore visibility if supported |
+| `POST` | `/api/v1/chats/{conversationId}/read` | Mark conversation read through a cursor |
+
+**Example request to create or reuse a direct chat:**
+
+```http
+POST /api/v1/conversations/direct
+Content-Type: application/json
+Authorization: Bearer <access-token>
+
+{
+  "targetUserId": "target-user-uuid"
+}
+```
+
+**Response:**
+
+```json
+{
+  "conversationId": "conversation-uuid",
+  "type": "DIRECT",
+  "created": true,
+  "members": [
+    { "userId": "current-user-uuid" },
+    { "userId": "target-user-uuid" }
+  ]
+}
+```
+
+`created` is `false` when an existing conversation is reused. **The current user's identity must come from the authenticated principal, not from the request body.**
+
+For **chat-list pagination**, sort by the latest visible message activity and return a cursor. Each row should contain:
+
+- The other participant's allowed profile fields
+- Latest message preview
+- Timestamp
+- Unread count or cursor
+- Mute/archive state
+- Pinned state
+
+**Example chat-list response:**
+
+```json
+{
+  "items": [
+    {
+      "conversationId": "conversation-uuid",
+      "type": "DIRECT",
+      "otherUser": {
+        "userId": "target-user-uuid",
+        "username": "mohan",
+        "displayName": "Mohan Kumar",
+        "avatarUrl": "https://..."
+      },
+      "lastMessage": {
+        "messageId": "message-uuid",
+        "type": "TEXT",
+        "preview": "Hello! How are you?",
+        "senderId": "target-user-uuid",
+        "createdAt": "2026-10-16T15:30:00Z"
+      },
+      "unreadCount": 3,
+      "archived": false,
+      "pinned": false,
+      "mutedUntil": null
+    }
+  ],
+  "nextCursor": "cursor-string"
+}
+```
+
+## 9.3 Message APIs
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/conversations/{id}/messages` | Send a message through REST |
+| `GET` | `/api/v1/conversations/{id}/messages?limit=50&before=...` | Fetch message history |
+| `GET` | `/api/v1/messages/{messageId}` | Get an accessible message |
+| `PATCH` | `/api/v1/messages/{messageId}` | Edit an eligible message |
+| `DELETE` | `/api/v1/messages/{messageId}` | Delete according to explicit scope |
+| `POST` | `/api/v1/messages/{messageId}/reactions` | Add a reaction |
+| `DELETE` | `/api/v1/messages/{messageId}/reactions/{emoji}` | Remove a reaction |
+| `POST` | `/api/v1/messages/{messageId}/forward` | Forward (later feature) |
+
+**Example send request:**
+
+```json
+{
+  "clientMessageId": "d6a7c58d-9f6e-4d0a-b25a-3d2d...",
+  "type": "TEXT",
+  "content": "Hello! How are you?",
+  "replyToMessageId": null
+}
+```
+
+**Example response:**
+
+```json
+{
+  "messageId": "message-uuid",
+  "conversationId": "conversation-uuid",
+  "senderId": "current-user-uuid",
+  "clientMessageId": "d6a7c58d-9f6e-4d0a-b25a-3d2d...",
+  "type": "TEXT",
+  "content": "Hello! How are you?",
+  "sequenceNumber": 101,
+  "createdAt": "2026-10-16T15:30:00Z",
+  "editedAt": null,
+  "deleted": false
+}
+```
+
+**Why both REST and WebSocket sending?**
+
+- REST gives you a reliable fallback and simple integration tests.
+- WebSocket provides low-latency interactive commands.
+- You can launch with REST message sending plus WebSocket delivery, then add WebSocket sending if it fits the client design.
+- **If both transports support sending, both must call the same application service and idempotency logic. Do not implement two different message-creation workflows.**
+
+**History pagination:**
+
+- Use **cursor-based** pagination keyed on `sequence_number`.
+- `before` is a cursor: the sequence number of the oldest message currently loaded.
+- `limit` is bounded (max 100).
+- Return `nextCursor` and `hasMore`.
+
+**Example history response:**
+
+```json
+{
+  "items": [
+    {
+      "messageId": "message-uuid",
+      "senderId": "target-user-uuid",
+      "type": "TEXT",
+      "content": "Hey!",
+      "sequenceNumber": 99,
+      "createdAt": "2026-10-16T15:29:00Z",
+      "editedAt": null,
+      "deleted": false
+    }
+  ],
+  "nextCursor": 98,
+  "hasMore": true
+}
+```
+
+## 9.4 Read receipts and delivery APIs
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/conversations/{id}/receipts/delivered` | Acknowledge a delivered cursor or message batch |
+| `POST` | `/api/v1/conversations/{id}/receipts/read` | Mark messages read through a message/cursor |
+| `GET` | `/api/v1/messages/{messageId}/receipts` | View permitted receipt details |
+
+**Example request:**
+
+```json
+{ "throughMessageId": "message-uuid" }
+```
+
+Prefer a **monotonic cursor** over one request per message. If the client marks message 150 as read, the server can update the read cursor for that participant through sequence 150, subject to conversation and privacy rules.
+
+**Do not allow a client to mark another user's messages as delivered or read.**
+
+## 9.5 Reactions
+
+**Example:**
+
+```http
+POST /api/v1/messages/{messageId}/reactions
+Content-Type: application/json
+
+{ "emoji": "👍" }
+```
+
+**Response:**
+
+```json
+{
+  "messageId": "message-uuid",
+  "reactions": [
+    { "emoji": "👍", "count": 3, "reactedByMe": true }
+  ]
+}
+```
+
+## 9.6 Attachments and media APIs
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/attachments/upload-intents` | Request an authorized upload intent |
+| `POST` | `/api/v1/attachments/{id}/complete` | Confirm upload completion |
+| `GET` | `/api/v1/attachments/{id}` | Get metadata and permitted access information |
+| `DELETE` | `/api/v1/attachments/{id}` | Delete an unattached or otherwise eligible asset |
+| `POST` | `/api/v1/conversations/{id}/messages` | Send a message referencing ready attachments |
+
+**Example upload-intent request:**
+
+```json
+{
+  "filename": "project-notes.pdf",
+  "mimeType": "application/pdf",
+  "sizeBytes": 248000
+}
+```
+
+**Example upload-intent response:**
+
+```json
+{
+  "attachmentId": "attachment-uuid",
+  "uploadMethod": "POST",
+  "uploadUrl": "https://api.cloudinary.com/v1_1/<cloud>/auto/upload",
+  "uploadFields": {
+    "api_key": "...",
+    "timestamp": 1790000000,
+    "signature": "...",
+    "folder": "chat/attachments"
+  },
+  "expiresAt": "2026-10-16T16:00:00Z",
+  "status": "PENDING"
+}
+```
+
+> The actual upload method, headers, and fields depend on the storage provider. A **Cloudinary signed upload** is not the same as a generic object-storage PUT; implement the provider's exact protocol.
+
+**Do not trust the browser's `mimeType` or `sizeBytes` alone.** Verify the uploaded asset through **Cloudinary metadata** and, where appropriate, inspect the actual file signature.
+
+**Sending a media message:**
+
+```json
+{
+  "clientMessageId": "client-generated-uuid",
+  "type": "IMAGE",
+  "content": "Here is the photo",
+  "attachments": [
+    { "attachmentId": "ready-attachment-uuid" }
+  ]
+}
+```
+
+## 9.7 Presence and privacy APIs
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/users/{userId}/presence` | Fetch presence if visible to caller |
+| `PATCH` | `/api/v1/me/privacy` | Update last-seen/read-receipt preferences |
+| `GET` | `/api/v1/me/privacy` | Read current privacy preferences |
+
+**Typing should normally be a WebSocket event**, not a durable REST resource. Online status can be queried through REST for initial rendering and updated over WebSocket afterward.
+
+## 9.8 Standard error responses
+
+Reuse your existing global exception handling and `ApiError` conventions **instead of introducing a second error format**.
+
+The API should distinguish at least:
+
+| Status | Meaning |
+|---|---|
+| `400 Bad Request` | Invalid payload or unsupported message type |
+| `401 Unauthorized` | No valid authentication |
+| `403 Forbidden` | Authenticated but not allowed to access the operation |
+| `404 Not Found` | Resource absent or intentionally concealed by a privacy policy |
+| `409 Conflict` | Incompatible state or duplicate resource conflict not handled idempotently |
+| `413 Content Too Large` | Upload/message exceeds allowed size |
+| `429 Too Many Requests` | Rate limit exceeded |
+| `500 Internal Server Error` | Unexpected server failure |
+
+Use stable machine-readable error codes such as:
+
+- `CONVERSATION_ACCESS_DENIED`
+- `USER_BLOCKED`
+- `MESSAGE_EDIT_EXPIRED`
+- `ATTACHMENT_NOT_READY`
+- `MESSAGE_DELETE_FORBIDDEN`
+- `REPLY_TARGET_INVALID`
+- `MESSAGE_RATE_LIMITED`
+- `UPLOAD_QUOTA_EXCEEDED`
+
+**Do not return stack traces or internal provider credentials.**
+
+---
+
+# 10. Real-time messaging architecture
+
+Use **Spring WebSocket with STOMP** as a practical initial choice if you want structured destinations, subscriptions, and message routing. Plain WebSocket is also valid, but then you must define your own command and subscription protocol.
+
+## 10.1 Connection and authentication
+
+**Recommended connection lifecycle:**
+
+1. The user signs in using the existing `auth` module.
+2. The client obtains a valid access credential using the existing token/session mechanism.
+3. The client opens a secure WebSocket connection using `wss://`.
+4. The server validates the connection or STOMP CONNECT credentials.
+5. The server associates the connection with the authenticated user and session/device.
+6. The client subscribes to authorized destinations.
+7. On disconnect, the server updates presence after considering other active connections.
+
+> **Your current JWT authentication filter is an HTTP security component; do not assume it automatically secures WebSocket subscriptions and STOMP commands.** Configure the WebSocket handshake or inbound channel interceptor to validate credentials explicitly.
+
+**For browsers:** WebSocket APIs do not allow arbitrary custom headers in the same way as normal HTTP clients. If your existing authentication uses secure cookies, ensure the handshake uses them correctly and has **strict Origin validation**. If a token is sent in the STOMP CONNECT frame, validate it there and **never put access tokens in URL query parameters**. Apply the correct CSRF protections for the selected cookie-based setup.
+
+**For mobile clients:** use the platform's secure credential storage and the same server-side authentication rules.
+
+## 10.2 Destination design
+
+An illustrative destination layout:
+
+| Destination | Purpose |
+|---|---|
+| `/app/messages.send` | Client send command, if using WebSocket sends |
+| `/app/messages.read` | Client read cursor command |
+| `/app/typing.start` | Start typing indicator |
+| `/app/typing.stop` | Stop typing indicator |
+| `/user/queue/events` | Private events for the authenticated user |
+| `/user/queue/errors` | Private real-time errors |
+| `/topic/conversations/{id}` | Shared conversation events, **only with enforced membership authorization** |
+
+> **Critical rule:** never allow a user to subscribe to any conversation simply by guessing its UUID. **Authorize subscriptions against current membership and blocking/account policies.** Use a private user destination for events that only one recipient should receive.
+
+## 10.3 Standard event envelope
+
+Use one consistent event structure across the application:
+
+```json
+{
+  "eventId": "event-uuid",
+  "type": "message.created",
+  "conversationId": "conversation-uuid",
+  "occurredAt": "2026-10-16T15:30:00Z",
+  "data": {
+    "messageId": "message-uuid",
+    "senderId": "user-uuid",
+    "type": "TEXT",
+    "content": "Hello!",
+    "sequenceNumber": 101,
+    "createdAt": "2026-10-16T15:30:00Z"
+  }
+}
+```
+
+**Event types:**
+
+| Type | Meaning |
+|---|---|
+| `message.created` | A new message was persisted |
+| `message.updated` | A message was edited |
+| `message.deleted` | A message was deleted (for me or for everyone) |
+| `message.reaction.added` | A reaction was added |
+| `message.reaction.removed` | A reaction was removed |
+| `message.delivered` | A recipient acknowledged delivery |
+| `message.read` | A recipient advanced the read cursor |
+| `conversation.updated` | Conversation settings changed |
+| `conversation.member.joined` | Membership change |
+| `conversation.member.left` | Membership change |
+| `typing.started` | Typing indicator on |
+| `typing.stopped` | Typing indicator off |
+| `presence.changed` | Online/offline transition |
+| `attachment.ready` | An attachment is validated and ready for use |
+
+**Use a DTO for the event envelope; do not broadcast JPA entities directly.**
+
+## 10.4 The correct send-message sequence
+
+```
+1. Client submits command
+   REST or authenticated WebSocket command with clientMessageId.
+
+2. Validate and authorize
+   Validate conversation membership, account status, blocks, payload,
+   reply target, and attachment access.
+
+3. Persist transactionally
+   Create the message, assign its sequence, update the conversation summary,
+   and record an event/outbox entry — all in one transaction.
+
+4. Publish the committed event
+   Deliver the message event to authorized recipients through WebSocket.
+
+5. Acknowledge and recover
+   The sender sees sent status; recipients acknowledge delivery/read
+   as appropriate; reconnecting clients fetch missed history.
+```
+
+**Why the outbox?**
+
+If the database transaction commits but the server crashes before publishing, the message **must not disappear** from the recipient's perspective. Store an event record **in the same database transaction as the message**, then publish it asynchronously. Mark it published only after the publisher succeeds, with retries and idempotent consumers.
+
+For an initial single-instance implementation, you can begin with a **simple publisher after commit**. However, design the service boundary so a durable outbox can be added **without rewriting message creation**.
+
+## 10.5 Duplicate messages and retries
+
+A client may send a message, lose its network connection, and retry because it never received the response. **Without idempotency, this can create duplicate messages.**
+
+**For every message send:**
+
+1. The client generates a unique `clientMessageId`.
+2. The backend checks whether that sender already submitted that ID.
+3. If it exists, **return the original persisted message**.
+4. Otherwise, create the message and save the idempotency key **atomically**.
+5. The client reconciles its optimistic message with the canonical server response.
+
+**This must work for both REST and WebSocket sending.**
+
+**Implementation sketch:**
+
+```java
+@Transactional
+public Message sendMessage(UUID senderId, SendMessageCommand cmd) {
+    // Idempotency check
+    Optional<Message> existing = messageRepo
+        .findBySenderIdAndClientMessageId(senderId, cmd.clientMessageId());
+    if (existing.isPresent()) {
+        return existing.get();
+    }
+
+    // Authorization
+    ConversationAuthorizationService.requireCanSend(senderId, cmd.conversationId());
+
+    // Persist
+    Conversation c = conversationRepo.findByIdForUpdate(cmd.conversationId())
+        .orElseThrow(...);
+    long seq = c.nextSequence();
+
+    Message m = Message.builder()
+        .id(UUID.randomUUID())
+        .conversationId(cmd.conversationId())
+        .senderId(senderId)
+        .clientMessageId(cmd.clientMessageId())
+        .sequenceNumber(seq)
+        .messageType(cmd.type())
+        .content(cmd.content())
+        .replyToMessageId(cmd.replyToMessageId())
+        .createdAt(Instant.now())
+        .build();
+    messageRepo.save(m);
+
+    // Update conversation summary
+    c.setLastMessageId(m.getId());
+    c.setLastMessageAt(m.getCreatedAt());
+    conversationRepo.save(c);
+
+    // Outbox event
+    outboxRepo.save(RealtimeOutbox.of("message.created", m));
+
+    return m;
+}
+```
+
+## 10.6 Ordering and reconnects
+
+- **Do not rely solely on WebSocket arrival order.** A reconnect, multiple devices, or concurrent sends may lead to duplicates or out-of-order events.
+- Assign a **stable sequence number** within each conversation.
+- Paginate history by sequence or another stable cursor.
+- Include **event IDs and message IDs for deduplication**.
+- On reconnect, fetch messages after the last known cursor.
+- Treat WebSocket as the **low-latency delivery path**, not the only history source.
+- If you later support multiple application instances, use **shared coordination and event distribution** so clients connected to different instances receive updates.
+
+## 10.7 WebSocket configuration sketch
+
+```java
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+        config.enableSimpleBroker("/topic", "/queue");
+        config.setApplicationDestinationPrefixes("/app");
+        config.setUserDestinationPrefix("/user");
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/ws")
+                .setAllowedOriginPatterns("https://app.example.com")
+                .withSockJS();
+    }
+
+    @Override
+    public void configureClientInboundChannel(ChannelRegistration registration) {
+        registration.interceptors(new AuthChannelInterceptor(jwtService));
+    }
+}
+```
+
+```java
+@Component
+public class AuthChannelInterceptor implements ChannelInterceptor {
+
+    @Override
+    public Message<?> preSend(Message<?> message, MessageChannel channel) {
+        StompHeaderAccessor accessor =
+            MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
+
+        if (StompCommand.CONNECT.equals(accessor.getCommand())) {
+            String token = accessor.getFirstNativeHeader("Authorization");
+            Principal principal = jwtService.authenticate(token);
+            accessor.setUser(principal);
+        }
+
+        if (StompCommand.SUBSCRIBE.equals(accessor.getCommand())) {
+            String destination = accessor.getDestination();
+            Principal principal = accessor.getUser();
+            subscriptionAuthorizationService.authorize(principal, destination);
+        }
+
+        return message;
+    }
+}
+```
+
+---
+
+# 11. Message lifecycle and WhatsApp-like interactions
+
+## 11.1 Text message
+
+**When the user presses Send:**
+
+1. The frontend creates a **temporary message bubble** with a local ID.
+2. The client sends the message command with `clientMessageId`.
+3. The server validates the caller and persists the message.
+4. The server returns the canonical message ID and sequence number.
+5. The sender's temporary bubble is **reconciled** with the stored message.
+6. The recipient receives `message.created` over WebSocket.
+7. The recipient acknowledges delivery according to the protocol.
+8. When the recipient opens the conversation and the message is considered visible, the client sends a **read cursor**.
+9. The sender receives the updated **receipt event** if read receipts are enabled.
+
+> The UI should distinguish a **failed send** from a **sent message**. A failed network request must not silently become a permanently sent-looking bubble.
+
+## 11.2 Reply to a message
+
+A reply is a **new message with `reply_to_message_id`** pointing to the original message.
+
+**Validate that:**
+
+- The original message belongs to the **same conversation**.
+- The caller is **authorized to view it**.
+- The reply target has **not been removed** under a policy that makes it unavailable.
+- A deleted message can still be referenced **only if your product deliberately supports a deleted-message placeholder**.
+
+The reply response should include a **safe preview** of the target message, not unrestricted access to its data.
+
+## 11.3 Edit a message
+
+**`PATCH /api/v1/messages/{messageId}`**
+
+```json
+{ "content": "Updated message text" }
+```
+
+**Rules to define:**
+
+- Only the **sender** can edit their message.
+- Apply a **configurable edit time limit** if desired.
+- Do **not** allow edits to unsupported types or deleted messages.
+- Record `edited_at`.
+- Broadcast `message.updated` **after** the change commits.
+- Clients should **update the existing bubble** rather than append a second message.
+
+If audit/history requirements matter, retain an **edit-history table**. Otherwise, you can store only the latest content plus the edited timestamp. **Choose deliberately based on your retention policy.**
+
+## 11.4 Delete for me vs. delete for everyone
+
+These are **different operations**.
+
+**Delete for me:**
+- Affects the **requesting user's view**.
+- Must **not** remove the message for other participants.
+- Depending on your chosen semantics, use a per-user deletion record (`message_user_deletions`) or a history boundary.
+
+**Delete for everyone:**
+- Changes the **shared message state**.
+- Enforce **sender ownership**, a **configurable time limit** if desired, and any applicable **moderation or retention rules**.
+- Instead of physically deleting a row immediately, a **tombstone** can preserve ordering and let other clients show "This message was deleted."
+- **Do not trust a client-provided field like `"deleteForEveryone": true` without server-side authorization.**
+
+## 11.5 Reactions
+
+1. A reaction changes the message's **interaction state**, not the message content.
+2. **Store reactions separately.**
+3. **Broadcast** the updated reaction state to authorized conversation members.
+4. Support **removing** a reaction.
+5. Define whether each user can react with **multiple emoji** or **only one**.
+6. Ensure duplicate requests are **idempotent**.
+7. **Remove or redact** reactions according to the product's message deletion policy.
+
+## 11.6 Forwarding
+
+Forwarding is a **later feature**, but it should be designed as a **new message**, not as a shared pointer that bypasses access checks.
+
+**The backend should:**
+
+1. Verify the user can **read** the source message.
+2. Verify they can **send** to the destination conversation.
+3. Create a **new message** in the destination.
+4. Apply your **forwarding attribution policy**.
+5. Validate **attachment access and ownership** if media is forwarded.
+
+> **Do not allow forwarding to leak messages** from a conversation the caller is no longer permitted to access.
+
+---
+
+# 12. Sent, delivered, read, and unread behaviour
+
+A WhatsApp-like UI often uses a small number of indicators, but your backend must preserve their **distinct meanings**.
+
+| State | Backend meaning | Possible UI |
+|---|---|---|
+| **Pending** | Client has not received a successful server acknowledgement | Clock or pending indicator |
+| **Sent** | Persisted by the server | Single tick |
+| **Delivered** | Recipient client acknowledged delivery | Double tick |
+| **Read** | Recipient advanced the read cursor under the receipt policy | Blue double tick or equivalent |
+| **Failed** | Server rejected the command or a terminal failure occurred | Error icon and retry action |
+
+These are suggested UI mappings, **not universal requirements**.
+
+## 12.1 Unread counts
+
+For direct conversations, the server can derive **unread count** from the **last-read cursor** and messages after it, **excluding the user's own messages** where appropriate.
+
+For example:
+
+```
+Last read sequence: 120
+Latest sequence: 127
+Sequences 121–127 are new to that reader
+The actual unread count depends on which messages belong to the user,
+message visibility, and the chosen counting policy
+```
+
+**Do not blindly increment a stored unread counter every time a WebSocket event arrives.** Duplicate events and reconnects would inflate it. Use **sequence/cursor-based calculations** or a carefully maintained idempotent counter.
+
+## 12.2 Privacy settings
+
+Add preferences for:
+
+- Whether **last seen** is visible.
+- Whether **online status** is visible and to whom.
+- Whether **read receipts** are enabled.
+- Whether **typing status** is visible.
+- Who may see **profile/avatar** information.
+
+**Enforce these settings on the server.** Hiding an indicator in React alone does **not** protect the information.
+
+For **group conversations**, receipt behaviour may differ from direct chats. Decide whether users see individual reader identities, a read count, or only aggregate status.
+
+---
+
+# 13. Online presence, last seen, and typing indicators
+
+## 13.1 Online presence
+
+A user can have **several active sessions**: web, phone, and possibly desktop. **Do not store a single boolean `isOnline`** that one device can set to `false` while another is still connected.
+
+Use a **per-user/per-session presence record** in Redis with a heartbeat and expiration.
+
+**Conceptually:**
+
+```
+presence:user:{userId}:session:{sessionId}    → session presence with TTL
+presence:user:{userId}                        → derived or indexed active-session state
+typing:{conversationId}:{userId}              → temporary typing state with TTL
+```
+
+These are illustrative key names. **Use a consistent schema and avoid storing sensitive credentials in Redis.**
+
+**A user's overall presence is online while at least one valid session is active.**
+
+- On a **graceful disconnect**, remove that session.
+- If a client **disappears without disconnecting**, the TTL expires.
+
+**Presence service sketch:**
+
+```java
+@Service
+public class PresenceService {
+
+    private final RedisPresenceStore store;
+    private final UserPresenceSettingsRepository settingsRepo;
+
+    public void markSessionActive(UUID userId, UUID sessionId) {
+        store.upsertSession(userId, sessionId, Duration.ofSeconds(60));
+    }
+
+    public void heartbeat(UUID userId, UUID sessionId) {
+        store.extendSession(userId, sessionId, Duration.ofSeconds(60));
+    }
+
+    public void markSessionInactive(UUID userId, UUID sessionId) {
+        store.removeSession(userId, sessionId);
+        if (store.activeSessionCount(userId) == 0) {
+            lastSeenService.recordOffline(userId, Instant.now());
+        }
+    }
+
+    public PresenceResponse getPresence(UUID viewerId, UUID targetId) {
+        UserPresenceSettings settings = settingsRepo.findByUserId(targetId)
+            .orElseGet(UserPresenceSettings::defaults);
+
+        if (!presencePrivacyService.canView(settings, viewerId, targetId)) {
+            return PresenceResponse.hidden();
+        }
+
+        boolean online = store.activeSessionCount(targetId) > 0;
+        Instant lastSeen = lastSeenService.getLastSeen(targetId);
+        return PresenceResponse.of(online, lastSeen);
+    }
+}
+```
+
+## 13.2 Last seen
+
+**Last seen is a privacy-sensitive timestamp**, not just a Redis key.
+
+- When the user transitions from **online to offline across all sessions**, update the **durable last-seen timestamp** according to the product's privacy policy.
+- **Avoid updating PostgreSQL on every heartbeat.**
+- When another user requests presence, evaluate **visibility rules** before returning the status.
+
+## 13.3 Typing indicators
+
+**Typing is ephemeral** and should **not** be stored as a permanent message.
+
+**Suggested commands:**
+
+```json
+{ "conversationId": "conversation-uuid", "state": "STARTED" }
+```
+
+```json
+{ "conversationId": "conversation-uuid", "state": "STOPPED" }
+```
+
+**Recommended behaviour:**
+
+- Publish typing updates **only to authorized participants** other than the sender.
+- **Expire typing state automatically** after a short period.
+- **Refresh the TTL** while typing continues.
+- **Stop typing** on send, blur, disconnect, or timeout.
+- **Rate-limit** updates; do not send one event for every keystroke.
+- **Do not reveal typing activity** to users who are blocked or not permitted to view the conversation.
+
+**Typing events should be transient**; reconnecting clients do **not** need a permanent typing-event history.
+
+---
+
+# 14. Media sharing with Cloudinary
+
+Use an **upload workflow** rather than sending large files through WebSocket.
+
+## 14.1 Upload workflow
+
+```
+1. Request upload permission
+   Client requests an upload intent for an allowed media type and size.
+
+2. Upload to object storage (Cloudinary)
+   Client uploads directly using a short-lived signed upload authorization.
+
+3. Verify the uploaded asset
+   Backend checks Cloudinary metadata, ownership, size, media type, and
+   applicable safety rules.
+
+4. Create a message
+   Message references only an attachment that is ready and authorized for use.
+
+5. Notify recipients
+   Publish the message event with attachment metadata and a permitted way
+   to retrieve the media.
+```
+
+## 14.2 Cloudinary integration
+
+Add the Cloudinary Java SDK to `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>com.cloudinary</groupId>
+    <artifactId>cloudinary-http45</artifactId>
+    <version>1.39.0</version>
+</dependency>
+```
+
+**Configuration:**
+
+```yaml
+cloudinary:
+  cloud-name: ${CLOUDINARY_CLOUD_NAME}
+  api-key: ${CLOUDINARY_API_KEY}
+  api-secret: ${CLOUDINARY_API_SECRET}
+  upload-folder: chat/attachments
+  signed-url-ttl-seconds: 3600
+```
+
+**Environment variables:**
+
+```properties
+CLOUDINARY_CLOUD_NAME=your-cloud-name
+CLOUDINARY_API_KEY=your-api-key
+CLOUDINARY_API_SECRET=your-api-secret
+CLOUDINARY_UPLOAD_FOLDER=chat/attachments
+CLOUDINARY_SIGNED_URL_TTL_SECONDS=3600
+```
+
+**Adapter implementation sketch:**
+
+```java
+@Service
+public class CloudinaryObjectStorageService implements ObjectStorageService {
+
+    private final Cloudinary cloudinary;
+    private final String uploadFolder;
+
+    @Override
+    public UploadIntent createUploadIntent(String filename, String mimeType,
+                                            long sizeBytes, UUID ownerId) {
+        long timestamp = Instant.now().getEpochSecond();
+        String folder = uploadFolder + "/" + ownerId;
+
+        Map<String, Object> params = Map.of(
+            "timestamp", timestamp,
+            "folder", folder,
+            "public_id", UUID.randomUUID().toString()
+        );
+        String signature = cloudinary.apiSignRequest(params, cloudinary.config.apiSecret);
+
+        return new UploadIntent(
+            "https://api.cloudinary.com/v1_1/"
+                + cloudinary.config.cloudName + "/auto/upload",
+            Map.of(
+                "api_key", cloudinary.config.apiKey,
+                "timestamp", timestamp,
+                "folder", folder,
+                "public_id", params.get("public_id"),
+                "signature", signature
+            ),
+            Instant.now().plusSeconds(600)
+        );
+    }
+
+    @Override
+    public AttachmentMetadata verifyUpload(String publicId, UUID ownerId) {
+        try {
+            Map<?, ?> result = cloudinary.api().resource(publicId, Map.of());
+            // Validate ownership (folder prefix), size, mime type, resource type
+            ...
+            return new AttachmentMetadata(...);
+        } catch (Exception e) {
+            throw new AttachmentVerificationException(e);
+        }
+    }
+
+    @Override
+    public String createSignedDownloadUrl(String publicId, Duration ttl) {
+        return cloudinary.url()
+            .resourceType("auto")
+            .type("upload")
+            .signed(true)
+            .generate(publicId);
+    }
+
+    @Override
+    public void deleteAsset(String publicId) {
+        try {
+            cloudinary.uploader().destroy(publicId, Map.of());
+        } catch (Exception e) {
+            log.warn("Cloudinary delete failed for {}", publicId, e);
+        }
+    }
+}
+```
+
+## 14.3 Media support plan
+
+| Type | Additional considerations |
+|---|---|
+| **Image** | Thumbnail, dimensions, orientation, content validation |
+| **GIF** | Validated image/animation formats; external GIF search can be added later |
+| **Video** | Duration, size, thumbnail, processing status |
+| **PDF/document** | MIME/signature validation, safe filename, download permissions |
+| **Audio** | Duration, codec, and size limits |
+| **Voice note** | Recording UI, playback state, optional waveform |
+| **Multiple attachments** | Attachment list, ordering, and per-file status |
+
+## 14.4 Size limits per category
+
+```properties
+ATTACHMENT_IMAGE_MAX_BYTES=10485760         # 10 MB
+ATTACHMENT_GIF_MAX_BYTES=5242880            # 5 MB
+ATTACHMENT_VIDEO_MAX_BYTES=104857600        # 100 MB
+ATTACHMENT_DOCUMENT_MAX_BYTES=26214400      # 25 MB
+ATTACHMENT_AUDIO_MAX_BYTES=26214400         # 25 MB
+ATTACHMENT_VOICE_NOTE_MAX_SECONDS=300       # 5 minutes
+ATTACHMENT_MAX_PER_MESSAGE=10
+```
+
+## 14.5 Security requirements
+
+- Set **separate size limits** for each media category.
+- **Do not accept executable files** unless you have an explicit safe-use case.
+- **Validate actual content** rather than trusting file extensions.
+- **Sanitize filenames** before displaying or logging them.
+- **Prevent public access to private files** where the product requires access control.
+- Use **short-lived signed access URLs** or an authorized download proxy.
+- **Check conversation membership** before issuing access to a private attachment.
+- **Remove orphaned uploads** that were never attached to a message.
+- Consider **malware scanning** for documents and other risky file types.
+- **Avoid logging signed URLs or storage credentials.**
+
+> Cloudinary can be suitable for images, video, and certain raw files. **Confirm supported resource types and delivery behaviour for your chosen account and configuration** before relying on it for all document/audio use cases.
+
+## 14.6 Orphaned upload cleanup
+
+An attachment row with `upload_status = 'PENDING'` for more than 24 hours is orphaned. A scheduled job should:
+
+1. Find pending attachments older than 24 hours.
+2. Attempt `DELETE` on the Cloudinary asset.
+3. Mark the row `REJECTED` with a reason.
+
+---
+
+# 15. Blocking and account-lifecycle integration
+
+Your current application already has a **block module** and **account deletion/recovery logic**. Phase 2 should **reuse those rules** instead of creating a separate messaging-only block system.
+
+Before creating a conversation, sending a message, editing a message, or issuing media access, **enforce the relevant policies**.
+
+## 15.1 When user A blocks user B
+
+Define and test the behaviour explicitly:
+
+| Question | Recommended default |
+|---|---|
+| Can A still view the historical conversation? | **Yes** |
+| Can A send new messages to B? | **No** |
+| Can B send new messages to A? | **No** |
+| Can either see the other's online status or last seen? | **No** |
+| Can either retrieve existing shared attachments? | **Yes** (historical) |
+| Can a block be reversed without recreating the conversation? | **Yes** |
+
+**Do not automatically delete all historical messages when a block is created.**
+
+**Implementation:**
+
+```java
+@Service
+public class ConversationAuthorizationService {
+
+    private final ConversationMemberRepository memberRepo;
+    private final BlockPolicy blockPolicy;
+    private final AccountStatusPolicy accountStatusPolicy;
+
+    public void requireCanSend(UUID userId, UUID conversationId) {
+        requireMembership(userId, conversationId);
+        accountStatusPolicy.requireCanSendMessages(userId);
+
+        Set<UUID> otherMembers = memberRepo.findOtherActiveMemberIds(
+            conversationId, userId);
+
+        for (UUID other : otherMembers) {
+            if (blockPolicy.hasAnyBlock(userId, other)) {
+                throw new ConversationAccessDeniedException("USER_BLOCKED");
+            }
+        }
+    }
+
+    public void requireCanView(UUID userId, UUID conversationId) {
+        requireMembership(userId, conversationId);
+        accountStatusPolicy.requireCanAuthenticate(userId);
+    }
+
+    private void requireMembership(UUID userId, UUID conversationId) {
+        boolean isMember = memberRepo.existsActive(conversationId, userId);
+        if (!isMember) {
+            throw new ConversationAccessDeniedException(
+                "CONVERSATION_ACCESS_DENIED");
+        }
+    }
+}
+```
+
+## 15.2 When an account is pending deletion
+
+Use the **account status checks already established** by the existing account/authentication architecture.
+
+Define what happens when a user requests account deletion:
+
+| Question | Recommended default |
+|---|---|
+| Prevent new messaging? | **Yes** |
+| Existing conversations visible to other participants? | **Yes** (frozen) |
+| Prevent bypass through existing WebSocket? | **Yes** — revalidate per command |
+| Revalidate account status per sensitive command? | **Yes** |
+| On final deletion, apply retention/identity cleanup? | **Yes** — tombstone per Phase 1 |
+
+**WebSocket revalidation:**
+
+```java
+@Component
+public class AccountStatusChannelInterceptor implements ChannelInterceptor {
+
+    @Override
+    public Message<?> preSend(Message<?> message, MessageChannel channel) {
+        StompHeaderAccessor accessor =
+            MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
+
+        Principal principal = accessor.getUser();
+        if (principal == null) return message;
+
+        UUID userId = UUID.fromString(principal.getName());
+        if (!accountStatusPolicy.canAuthenticate(userId)) {
+            throw new AccountNotActiveException();
+        }
+
+        return message;
+    }
+}
+```
+
+**Do not assume a socket connection is permanent authorization.** Revalidate for:
+
+- Subscribing to a conversation
+- Sending a message
+- Marking messages read
+- Adding or removing a reaction
+- Requesting attachment access
+
+---
+
+# 16. Security requirements for the messaging module
+
+Treat **every REST endpoint, WebSocket command, subscription, and media download** as a **separate authorization boundary**.
+
+## 16.1 Authentication and authorization checklist
+
+- [ ] Authenticate all private REST APIs.
+- [ ] Authenticate WebSocket handshakes or STOMP connections.
+- [ ] Authorize subscriptions to conversation destinations.
+- [ ] Derive `senderId` from the **server-side authenticated principal**.
+- [ ] Check **active conversation membership** for history, reactions, receipts, and attachment access.
+- [ ] Check the **target message belongs to the requested conversation**.
+- [ ] Apply **block and account-status rules** consistently.
+- [ ] Validate **UUIDs and all request fields**.
+- [ ] Use **rate limits** for searches, message sends, typing events, and uploads.
+- [ ] Restrict **message size and supported content types**.
+- [ ] Configure **CORS and WebSocket Origin policies** deliberately.
+- [ ] Keep secrets in environment/configuration management; **never commit `.env` secrets**.
+- [ ] Avoid logging access tokens, OTPs, message bodies, or signed media URLs unnecessarily.
+- [ ] Keep **authorization tests** for every operation that reads or changes another user's data.
+
+## 16.2 WebSocket-specific security
+
+**A connected socket is not permanent authorization.**
+
+**Recheck permissions when the client:**
+
+- Subscribes to a conversation.
+- Sends a message.
+- Marks messages read.
+- Adds or removes a reaction.
+- Requests attachment access.
+- Attempts a privileged group operation in a later phase.
+
+**On logout, revoke or invalidate the relevant session and close or reject its active socket.** If multiple application instances are used, **coordinate revocation** so that another instance cannot keep accepting commands from a revoked session.
+
+## 16.3 Content safety
+
+- If users can send arbitrary text, **validate length** and **safely render content on the frontend**.
+- **Do not render untrusted message content as raw HTML.**
+- If you support **links, previews, or rich text** later, isolate the preview-fetching process to prevent **server-side request forgery** and other URL-fetching risks.
+- For **Cloudinary URLs**, always use **signed URLs with a short TTL** for private assets.
+
+## 16.4 Rate limits
+
+Add these Redis keys:
+
+| Key | Limit | TTL |
+|---|---|---|
+| `chat:rl:search:{user-hmac}` | 60/min | 1 min |
+| `chat:rl:conversation-create:{user-hmac}` | 30/min | 1 min |
+| `chat:rl:message-send:{user-hmac}` | 120/min | 1 min |
+| `chat:rl:message-send:{conversation-hmac}` | 600/min | 1 min |
+| `chat:rl:typing:{user-hmac}` | 30/min | 1 min |
+| `chat:rl:upload-intent:{user-hmac}` | 30/hour | 1 hour |
+| `chat:rl:attachment-download:{user-hmac}` | 300/hour | 1 hour |
+| `chat:rl:reaction:{user-hmac}` | 120/min | 1 min |
+
+**Fail closed** for sensitive limits (message sends, uploads) when Redis is unavailable.
+
+---
+
+# 17. The end-to-end encryption decision
+
+Before finalizing the message schema and media design, **decide what privacy model the application promises**.
+
+## Option A — Server-readable messages
+
+**Simpler first release.**
+
+- The backend receives and stores **ordinary message content**.
+- Transport security protects data **in transit**.
+- Database/storage encryption can protect data **at rest**.
+- **Authorized backend services may still be able to access message content.**
+
+## Option B — End-to-end encrypted messages
+
+**Requires early design.**
+
+- Clients **encrypt content before transmission**.
+- The server stores **ciphertext** and routes it to authorized devices, **without holding the keys** required to decrypt message bodies.
+
+> **These are materially different architectures.** HTTPS, JWT authentication, and database encryption do **not** constitute end-to-end encryption.
+
+## 17.1 Why the decision matters
+
+With end-to-end encryption, you need to plan:
+
+- Per-device identity and encryption keys
+- Key registration and verification
+- Secure session establishment and ratcheting
+- Multi-device message distribution
+- Encrypted attachment upload and retrieval
+- Key changes when devices are added or removed
+- Encrypted backups, if offered
+- Recovery when a user loses access to their devices
+- How search, previews, reporting, and message editing work without server-readable content
+
+> **Do not invent a cryptographic protocol for production.** If you choose this route, use a **well-reviewed protocol** and appropriate maintained cryptographic implementations.
+
+## 17.2 Practical recommendation
+
+- If your goal is to **learn and build the core chat product first**, start with **server-readable messages** only if that matches the privacy promise you intend to make. **Document the limitation clearly.**
+- If your goal is specifically **WhatsApp-style end-to-end privacy**, make that decision **now**, before you commit to a plain-text-only schema. **Adding E2EE later is a major redesign, not a small enhancement.**
+
+---
+
+# 18. React frontend integration
+
+Keep the frontend **independent of the transport details**. The UI should consume **normalized** message and conversation models whether data arrives from REST, WebSocket, or local optimistic state.
+
+## 18.1 Suggested frontend structure
+
+```
+src/
+├── features/
+│   ├── user-search/
+│   ├── conversations/
+│   │   ├── api/
+│   │   ├── components/
+│   │   ├── hooks/
+│   │   └── types/
+│   ├── messaging/
+│   │   ├── api/
+│   │   ├── components/
+│   │   ├── hooks/
+│   │   └── types/
+│   ├── attachments/
+│   ├── reactions/
+│   ├── receipts/
+│   └── presence/
+├── realtime/
+│   ├── websocket-client.ts
+│   ├── event-router.ts
+│   └── reconnect-manager.ts
+├── shared/
+│   ├── api-client.ts
+│   └── auth/
+└── app/
+```
+
+## 18.2 Chat screen behaviour
+
+The interface typically contains:
+
+1. **Left sidebar:** chat list, search, filters.
+2. **Conversation header:** other user's display name, avatar, visible presence.
+3. **Message history:** paginated messages grouped by date.
+4. **Message composer:** text input, attachments, send button.
+5. **Message actions:** reply, react, edit, delete, copy.
+6. **Delivery indicators:** sent, delivered, read.
+7. **Typing indicator.**
+8. **Attachment previews and upload progress.**
+9. **Loading, offline, retry, and error states.**
+
+## 18.3 Frontend reliability rules
+
+1. Render **optimistic messages with a temporary ID**.
+2. Replace them with the **canonical server message** after success.
+3. **Deduplicate messages** by ID and idempotency key.
+4. **Merge WebSocket events into the same cache/state** used by REST.
+5. **Preserve scroll position** while older history is loaded.
+6. **Fetch missing messages after reconnecting.**
+7. Show **failed messages with an explicit retry action.**
+8. **Never infer that a message was delivered** merely because the sender's WebSocket is connected.
+
+> **Do not create separate conflicting state stores for REST messages and WebSocket messages.** Use one normalized message cache per conversation.
+
+## 18.4 Reconnect manager sketch
+
+```typescript
+export class ReconnectManager {
+  private lastSequenceByConversation = new Map<string, number>();
+
+  async onReconnect() {
+    for (const [conversationId, lastSeq] of this.lastSequenceByConversation) {
+      const missed = await fetchMessagesAfter(conversationId, lastSeq);
+      for (const msg of missed.items) {
+        messageCache.upsert(conversationId, msg);
+      }
+    }
+    await resubscribeAll();
+  }
+
+  track(conversationId: string, sequence: number) {
+    const current = this.lastSequenceByConversation.get(conversationId) ?? 0;
+    if (sequence > current) {
+      this.lastSequenceByConversation.set(conversationId, sequence);
+    }
+  }
+}
+```
+
+---
+
+# 19. Performance and scaling
+
+You do **not** need to begin with microservices, Kafka, or a complex distributed architecture. You **do** need to avoid design choices that make scaling unnecessarily difficult.
+
+## 19.1 PostgreSQL
+
+- Index message history by **conversation and sequence**.
+- Use **cursor pagination** rather than loading all history.
+- Enforce **unique constraints** for idempotency and direct-conversation identity.
+- Keep **large media out of the database**.
+- Use **bounded transactions**.
+- Avoid updating the same conversation summary unnecessarily for every secondary operation.
+- Monitor query plans and slow queries **before** adding complexity.
+
+## 19.2 Redis
+
+Use Redis for **ephemeral state and shared coordination** where appropriate:
+
+- Presence session TTLs
+- Typing TTLs
+- Rate limits
+- Short-lived coordination state
+- Pub/Sub or other distribution mechanisms when multiple application instances need to exchange events
+
+> **Redis Pub/Sub is not a durable message queue.** If a consumer is offline, an ordinary Pub/Sub event may be missed. **Durable message history and outbox/replay mechanisms must cover that gap.**
+
+## 19.3 Multiple Spring Boot instances
+
+If you run more than one application instance:
+
+- A client may be connected to instance A while a recipient is connected to instance B.
+- **Local in-memory events alone will not reach the other instance.**
+- Use a **shared event-distribution mechanism** and a **durable event/recovery strategy**.
+- Make **presence shared** rather than instance-local.
+- Ensure event processing is **idempotent**.
+- Plan **graceful shutdown and socket reconnection**.
+
+> Add these only as the deployment needs them; **the modular monolith remains a good starting point.**
+
+## 19.4 Suggested scaling path
+
+| Stage | Infrastructure |
+|---|---|
+| **Local dev** | Single Spring Boot instance, single PostgreSQL, single Redis |
+| **Initial production** | 1–2 Spring Boot instances, managed PostgreSQL, managed Redis, Redis Pub/Sub for cross-instance events, Cloudinary for media |
+| **Growth** | 3+ instances, dedicated outbox worker, dedicated scheduler, read replica for history queries, Redis Streams for durable event distribution |
+| **Scale** | Sharded conversations, per-conversation message stores (if needed), dedicated realtime tier |
+
+**Do not skip stages.** Each stage adds operational complexity.
+
+---
+
+# 20. Testing strategy
+
+A chat application can appear to work in a happy-path demo while still **losing messages, exposing private conversations, or duplicating messages after reconnects**. Test business rules and failure scenarios from the beginning.
+
+## 20.1 Unit tests
+
+Use unit tests for **business rules that do not require a database or network**:
+
+- Direct conversation reuse and duplicate prevention
+- Block policy
+- Message edit eligibility
+- Delete-for-me vs. delete-for-everyone
+- Reply authorization
+- Reaction uniqueness
+- Read-cursor advancement
+- Attachment ownership and status validation
+- Presence privacy rules
+- Chat-list archive/hide behaviour
+
+## 20.2 Integration tests
+
+Use **PostgreSQL integration tests**, preferably with a disposable database such as **Testcontainers**:
+
+- Flyway migrations from the existing schema through the new Phase 2 schema
+- Conversation creation under **concurrent** requests
+- Message **idempotency** under retries
+- Transaction **rollback** when message creation fails
+- Sequence assignment under **concurrent** sends
+- Receipt persistence
+- Attachment-to-message associations
+- **Account deletion and blocking interactions**
+- Outbox retry behaviour
+- Repository pagination and indexes
+
+Use a **real Redis instance** in integration tests for TTL and multi-session presence behaviour where possible.
+
+## 20.3 REST API tests
+
+Add these to your existing Postman collection:
+
+| Test | Expected result |
+|---|---|
+| Authenticated user searches username | Only permitted profile fields returned |
+| Search does not create conversation | Chat count remains unchanged |
+| User creates direct conversation twice | Same conversation returned |
+| Two users create a direct chat concurrently | No duplicate direct conversations |
+| Unauthenticated user sends message | `401` |
+| Non-member reads conversation history | Denied |
+| Sender retries with same `clientMessageId` | Original message returned; no duplicate |
+| User edits another person's message | Denied |
+| User reacts to an inaccessible message | Denied |
+| User uploads an oversized file | Rejected |
+| User references another user's attachment | Denied |
+| Blocked user attempts a prohibited message | Rejected |
+| User marks an invalid read cursor | Rejected |
+| User archives a conversation | Only their chat-list state changes |
+
+Your current project includes a Postman collection and a unit-test package, so **extend those assets** instead of creating a completely separate testing workflow.
+
+## 20.4 WebSocket tests
+
+Create **automated integration tests** for:
+
+- Successful authenticated connection
+- Rejection of invalid or expired credentials
+- Rejection of unauthorized conversation subscriptions
+- Sending a message and receiving the corresponding event
+- Receipt updates delivered to the right participant
+- **No duplicate visible messages after a retry**
+- Reconnect and history recovery
+- Typing state expiration
+- Multiple active sessions for one user
+- Session revocation while a socket is open
+- Message publication retry after an outbox failure
+
+## 20.5 Frontend manual test scenarios
+
+1. Account A searches for account B.
+2. A opens B's profile **without creating a chat**.
+3. A starts a conversation and sends a text.
+4. B receives it **without refreshing the page**.
+5. B replies, and A receives the message.
+6. A archives the chat and verifies **B's chat list is unaffected**.
+7. A and B exchange replies and reactions.
+8. B reads the message, and A sees the appropriate receipt.
+9. A disconnects, receives a message after reconnecting, and **recovers the missing history**.
+10. A uploads an image or PDF, and B can access it **only while authorized**.
+11. A blocks B and verifies the agreed blocking rules.
+12. Repeat the test with **duplicate requests, expired credentials, and a slow network**.
+
+## 20.6 Cloudinary test strategy
+
+- Use a **test Cloudinary account** with a separate folder prefix (`test/`).
+- Never run automated tests against production Cloudinary.
+- Mock the `ObjectStorageService` in unit tests.
+- Use a real Cloudinary **test account** in integration tests, and clean up uploaded assets afterward.
+- Test **signed URL expiry** and **ownership validation**.
+- Test **orphaned upload cleanup**.
+
+---
+
+# 21. Implementation roadmap
+
+Build the module **incrementally**. Do not implement every WhatsApp-like feature before you have a reliable text-message flow.
+
+## 21.1 Step 01 — Conversation foundation
+
+**Start here.**
+
+- Flyway migrations for `conversations`, `conversation_members`, and `conversation_user_state`.
+- Implement **username discovery**, **create/reuse direct conversations**, **chat-list pagination**, and **archive/hide behaviour**.
+
+**Completion:** two users can create and retrieve **one consistent direct conversation**.
+
+## 21.2 Step 02 — Persistent text messaging
+
+- Create messages, validate membership and block rules, implement **idempotency**, **stable ordering**, **history pagination**, and basic send/receive UI.
+
+**Completion:** messages **survive application restarts** and retries **do not create duplicates**.
+
+## 21.3 Step 03 — Real-time communication
+
+- Secure **WebSocket/STOMP** setup, authenticated destinations, message events, **reconnection and history recovery**.
+- Add the **outbox** for reliable event publication.
+
+**Completion:** messages appear in the other client's open chat **without refresh**, and missed messages are recovered.
+
+## 21.4 Step 04 — Message interactions and receipts
+
+- Replies, edit/delete policies, reactions, sent/delivered/read state, and unread cursors.
+
+**Completion:** all interaction state is **persisted and synchronized** to the right clients.
+
+## 21.5 Step 05 — Presence and media
+
+- **Redis presence and typing**, privacy settings, secure **Cloudinary upload intents**, attachment validation, images, GIFs, and PDFs. Add video/audio according to tested limits.
+
+**Completion:** presence behaves correctly across sessions, and authorized users can share and retrieve validated media.
+
+## 21.6 Step 06 — Production hardening
+
+- **Load tests**, rate limits, metrics, structured logging, backups, retention policy, **recovery tests**, multi-instance event distribution, and operational monitoring.
+
+**Completion:** defined reliability and security tests pass under realistic conditions.
+
+---
+
+# 22. Phase 2 acceptance checklist
+
+Use this as the module's development checklist.
+
+## 22.1 Conversation foundation
+
+- [ ] Username search returns only allowed fields
+- [ ] Searching or viewing a profile does **not** create a chat
+- [ ] Direct conversations are created or reused **safely**
+- [ ] Archive, mute, pin, and hide settings are **per user**
+- [ ] `direct_pair_key` uniqueness prevents duplicate direct conversations
+
+## 22.2 Messaging
+
+- [ ] Text messages persist in PostgreSQL
+- [ ] Message history uses **stable cursor pagination**
+- [ ] Duplicate `clientMessageId` does **not** create duplicate messages
+- [ ] Replies, edits, reactions, and deletion follow **server-side rules**
+- [ ] Sequence numbers are **monotonic within a conversation**
+
+## 22.3 Real time
+
+- [ ] WebSocket authentication and **subscription authorization** work
+- [ ] Message events reach **authorized recipients**
+- [ ] Reconnect **recovers missed messages**
+- [ ] Delivery and read acknowledgements are **idempotent**
+- [ ] Outbox ensures **no committed message is lost**
+
+## 22.4 Media and presence
+
+- [ ] Uploads are **authorized and validated**
+- [ ] Private attachments **cannot be accessed** by guessing IDs
+- [ ] Cloudinary signed URLs have **short TTLs**
+- [ ] Orphaned uploads are **cleaned up**
+- [ ] Presence works across **multiple sessions**
+- [ ] Typing indicators **expire automatically**
+
+## 22.5 Security and reliability
+
+- [ ] Block and account-status policies **apply to messaging**
+- [ ] Unauthorized access tests **pass**
+- [ ] Migrations work on a **clean test database**
+- [ ] Logs **do not expose tokens** or private content unnecessarily
+- [ ] WebSocket subscriptions are **re-authorized per command**
+- [ ] Rate limits **fail closed** when Redis is unavailable
+- [ ] Cloudinary credentials are **never logged**
+
+---
+
+## Final architectural decisions
+
+The Phase 2 messaging module follows these rules:
+
+1. **PostgreSQL is the source of truth** for conversations, messages, membership, reactions, receipts, and user chat settings.
+2. **Redis manages ephemeral state** — presence, typing, rate limits, and cross-instance coordination.
+3. **WebSocket delivers live events**; it is not the message store.
+4. **REST supports loading, pagination, and management.**
+5. **Cloudinary holds media bytes**; PostgreSQL stores attachment metadata and references.
+6. **The sender is always derived from the authenticated principal.**
+7. **Block and account-status policies apply to every messaging operation.**
+8. **Message sending is idempotent** via `clientMessageId`.
+9. **Sequence numbers provide stable ordering within a conversation.**
+10. **The outbox pattern ensures no committed message is lost.**
+11. **Every REST endpoint, WebSocket command, subscription, and media download is a separate authorization boundary.**
+12. **Chat-list preferences are per-user**, never on the shared conversation row.
+13. **A connected socket is not permanent authorization** — recheck permissions per command.
+14. **The end-to-end encryption decision must be made before committing to the schema.**
+15. **Start with a modular monolith**; split into services only when scale justifies it.
+
+---
+
+**End of Phase 2 specification.**

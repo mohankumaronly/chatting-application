@@ -38,7 +38,23 @@ public enum ErrorCode {
     // Deletion
     DELETION_REQUEST_EXISTS(HttpStatus.CONFLICT, "An active deletion request already exists"),
     DELETION_RECOVERY_EXPIRED(HttpStatus.GONE, "Account recovery window has expired"),
-    DELETION_RECOVERY_INVALID(HttpStatus.UNAUTHORIZED, "Invalid or expired recovery token");
+    DELETION_RECOVERY_INVALID(HttpStatus.UNAUTHORIZED, "Invalid or expired recovery token"),
+
+    // Chat & Messaging (Phase 2)
+    CONVERSATION_ACCESS_DENIED(HttpStatus.FORBIDDEN, "Access to conversation denied"),
+    CONVERSATION_NOT_FOUND(HttpStatus.NOT_FOUND, "Conversation not found"),
+    USER_BLOCKED(HttpStatus.FORBIDDEN, "Cannot communicate with blocked user"),
+    MESSAGE_NOT_FOUND(HttpStatus.NOT_FOUND, "Message not found"),
+    MESSAGE_EDIT_EXPIRED(HttpStatus.BAD_REQUEST, "Message edit window has expired"),
+    MESSAGE_EDIT_FORBIDDEN(HttpStatus.FORBIDDEN, "Only the sender can edit this message"),
+    MESSAGE_DELETE_FORBIDDEN(HttpStatus.FORBIDDEN, "Not allowed to delete this message"),
+    REPLY_TARGET_INVALID(HttpStatus.BAD_REQUEST, "Reply target message is invalid or from another conversation"),
+    ATTACHMENT_NOT_FOUND(HttpStatus.NOT_FOUND, "Attachment not found"),
+    ATTACHMENT_NOT_READY(HttpStatus.BAD_REQUEST, "Attachment is not ready for use"),
+    ATTACHMENT_TOO_LARGE(HttpStatus.PAYLOAD_TOO_LARGE, "Attachment exceeds maximum allowed size"),
+    ATTACHMENT_VERIFICATION_FAILED(HttpStatus.BAD_REQUEST, "Attachment verification failed"),
+    MESSAGE_RATE_LIMITED(HttpStatus.TOO_MANY_REQUESTS, "Message rate limit exceeded"),
+    UPLOAD_QUOTA_EXCEEDED(HttpStatus.TOO_MANY_REQUESTS, "Upload rate limit exceeded");
 
     private final HttpStatus httpStatus;
     private final String defaultMessage;

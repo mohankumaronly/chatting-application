@@ -87,5 +87,9 @@ app:
     otp-hmac-base64: ${OTP_HMAC_KEY_BASE64:}
   cloudinary:
     cloud-name: ${CLOUDINARY_CLOUD_NAME:}
+    api-key: ${CLOUDINARY_API_KEY:}
+    api-secret: ${CLOUDINARY_API_SECRET:}
     upload-preset: ${CLOUDINARY_UPLOAD_PRESET:}
     avatar-folder: ${CLOUDINARY_AVATAR_FOLDER:chat-app/avatars}
+    upload-folder: ${CLOUDINARY_UPLOAD_FOLDER:chat/attachments}
+    signed-url-ttl-seconds: ${CLOUDINARY_SIGNED_URL_TTL_SECONDS:3600}
