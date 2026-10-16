@@ -1,0 +1,2494 @@
+# Production-Ready Authentication & Profile Module — Complete Updated Specification
+
+**Backend architecture and implementation specification · Java 21 · Spring Boot · PostgreSQL · Redis · Spring Security**
+
+This document is the **complete, self-contained blueprint** for building the authentication, profile, blocking, and account-deletion foundation of your WhatsApp-like chatting application. It supersedes the earlier version and includes every change required for production readiness.
+
+Use this as the single source of truth when creating the project in IntelliJ IDEA, implementing the backend, and testing every API in Postman.
+
+---
+
+## Table of Contents
+
+1. Project scope and architectural boundaries
+2. Complete user journey and account lifecycle
+3. REST API contract — complete endpoint inventory
+4. Modular monolith project structure
+5. PostgreSQL schema and data model
+6. Redis architecture
+7. OTP verification with Brevo
+8. Authentication strategy: tokens, cookies, sessions
+9. Google login and account linking
+10. Profile creation and username policy
+11. User blocking
+12. Account deletion with 20-day recovery
+13. Security configuration and authorization rules
+14. Environment configuration and secrets
+15. API request and response examples
+16. Standard error handling
+17. Background jobs and schedulers
+18. Postman testing strategy
+19. Automated testing strategy
+20. Production-readiness checklist
+21. Recommended implementation order
+22. Official implementation references
+
+---
+
+# 1. Project scope and architectural boundaries
+
+## 1.1 What we are building
+
+The first release covers **identity, authentication, account lifecycle, profile setup, user blocking, and account deletion with recovery**. It does **not** yet implement chat conversations, WebSocket messaging, media sharing, or group chats.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  React Web  ·  React Native  ·  Future Desktop               │
+│  HTTPS · JSON REST APIs · OAuth redirects where applicable   │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│              Spring Boot Modular Monolith                    │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐         │
+│  │Authentication│ │Account &     │ │Blocking &    │         │
+│  │              │ │Profile       │ │Deletion      │         │
+│  └──────────────┘ └──────────────┘ └──────────────┘         │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐         │
+│  │Email Delivery│ │Session       │ │Rate Limiting │         │
+│  │              │ │Security      │ │              │         │
+│  └──────────────┘ └──────────────┘ └──────────────┘         │
+└──────────────────────────────────────────────────────────────┘
+       │              │              │              │
+       ▼              ▼              ▼              ▼
+  ┌─────────┐   ┌─────────┐    ┌─────────┐   ┌─────────┐
+  │PostgreSQL│  │  Redis  │    │  Brevo  │   │ Google  │
+  │ accounts │  │ rate    │    │ emails  │   │ OAuth   │
+  │ sessions │  │ limits  │    │         │   │ OIDC    │
+  │ blocks   │  │ OTP     │    │         │   │         │
+  │ tombstones│ │ cache   │    │         │   │         │
+  └─────────┘   └─────────┘    └─────────┘   └─────────┘
+```
+
+**The most important architectural decision:**
+
+> Build **one modular monolith** with multiple client-compatible authentication flows, a shared user identity, independent session management for every device, and separate modules for account lifecycle (including blocking and deletion).
+
+## 1.2 Recommended technologies
+
+| Concern | Choice |
+|---|---|
+| Language | Java 21 |
+| Application framework | Spring Boot 3.x (maintained release) |
+| Security | Spring Security 6.x |
+| API style | REST, JSON, `/api/v1` |
+| Database | PostgreSQL 15+ |
+| Database migrations | Flyway |
+| ORM | Spring Data JPA / Hibernate |
+| Cache / rate limiting | Redis 7+ |
+| Email | Brevo transactional email API |
+| Google authentication | Spring Security OAuth2 Client / OpenID Connect |
+| Password hashing | Spring Security `PasswordEncoder` — Argon2id preferred, BCrypt acceptable |
+| Access token | Short-lived signed JWT |
+| Refresh token | Cryptographically random opaque token (hashed at rest) |
+| Recovery token | Cryptographically random opaque token (HMAC'd at rest) |
+| Validation | Jakarta Bean Validation |
+| API documentation | Springdoc OpenAPI |
+| Automated tests | JUnit 5, Spring Boot Test, Testcontainers |
+| API testing | Postman |
+| Scheduler | Spring `@Scheduled` (single-instance) or ShedLock (multi-instance) |
+
+**Use a compatible, maintained Spring Boot release when you start the repository.** Pin dependency versions through the Spring Boot dependency management system instead of individually choosing potentially incompatible library versions.
+
+## 1.3 Architectural principles
+
+These principles apply to **every** module and every endpoint in this document:
+
+1. **PostgreSQL is the source of truth** for accounts, identities, sessions, blocks, deletion requests, and tombstones.
+2. **Redis manages temporary state and distributed rate limits**; it never replaces durable session revocation or block state.
+3. **Brevo delivers emails**; your backend controls OTP, recovery token, and notification security.
+4. **Google identities are linked by their stable provider subject**, never by email matching alone.
+5. **Every API derives the authenticated user from the security context**, never from a client-supplied `userId`.
+6. **Never serialize JPA entities directly** as API responses — always use DTOs.
+7. **Controllers delegate to application services**; business rules live in services and domain objects.
+8. **Fail closed for sensitive operations** when Redis is unavailable.
+9. **Every state transition is transactional** where it touches PostgreSQL.
+10. **Every secret is independent** — JWT signing, OTP HMAC, identifier HMAC, field encryption, and recovery token HMAC keys must all be different.
+
+---
+
+# 2. Complete user journey and account lifecycle
+
+The backend enforces the workflow. The frontend can display screens in any order, but it must **never** be the authority for whether an account is verified, active, blocked, or pending deletion.
+
+## 2.1 Registration flow
+
+```
+1. Date of birth
+   └─ Collect date of birth, validate eligibility, start registration challenge.
+
+2. Email address
+   └─ Normalize and validate email, check eligibility (including tombstones),
+      send OTP via Brevo.
+
+3. OTP verification
+   └─ Verify OTP, consume it exactly once, authorize registration completion.
+
+4. Name and password
+   └─ Collect first name, last name, password. Hash the password before persistence.
+
+5. Keep me logged in
+   └─ Store preference for session lifetime policy.
+
+6. Account creation
+   └─ Create the user in PENDING_SETUP with verified email and no username yet.
+
+7. Mandatory username
+   └─ Choose and reserve a unique username. DB enforces uniqueness.
+
+8. Optional profile
+   └─ Add avatar and bio, or skip. Profile remains editable later.
+
+9. Activate account
+   └─ Complete setup, activate the account, create session, send welcome email.
+```
+
+## 2.2 Important distinction: verified email vs. active account
+
+These are **separate** states.
+
+- `emailVerified = true` means the user has proven control of the email address.
+- `status = PENDING_SETUP` means the account exists but mandatory setup is incomplete.
+- `status = ACTIVE` means registration finished and the user can use protected features.
+- `status = SUSPENDED` means normal access is restricted (moderation).
+- `status = PENDING_DELETION` means the user requested deletion; within recovery window.
+- `status = DEACTIVATED` means permanently removed or anonymized; cannot be recovered.
+
+> **Do not set `ACTIVE` merely because the OTP is correct.**
+
+## 2.3 Account state machine
+
+```
+                    ┌───────────────────────┐
+                    │  (registration start) │
+                    └───────────┬───────────┘
+                                │
+                                ▼
+                   ┌────────────────────────┐
+                   │  RegistrationChallenge │
+                   │   (Email OTP pending)  │
+                   └───────────┬────────────┘
+                        OTP verified
+                                │
+                                ▼
+                   ┌────────────────────────┐
+                   │   PENDING_SETUP        │
+                   │  (email verified,      │
+                   │   no username yet)     │
+                   └───────────┬────────────┘
+                  username assigned + setup finished
+                                │
+                                ▼
+                   ┌────────────────────────┐
+        ┌─────────►│       ACTIVE           │◄──────────┐
+        │          │  (fully usable account)│           │
+        │          └───┬──────────┬─────────┘           │
+        │              │          │                     │
+        │   user requests    moderation                │
+        │   deletion         action                    │
+        │              │          │                     │
+        │              ▼          ▼                     │
+        │   ┌─────────────────┐ ┌─────────────┐         │
+        │   │PENDING_DELETION │ │ SUSPENDED   │         │
+        │   │ (20-day window) │ │             │         │
+        │   └────┬────────┬───┘ └──────┬──────┘         │
+        │        │        │            │                │
+        │   recover  20 days pass      │ reinstate      │
+        │        │        │            │                │
+        └────────┘        ▼            └────────────────┘
+                   ┌─────────────┐
+                   │ DEACTIVATED │  (permanent, anonymized, tombstoned)
+                   └─────────────┘
+```
+
+**State transitions:**
+
+| From | To | Trigger | Notes |
+|---|---|---|---|
+| — | `PENDING_SETUP` | Registration completion | Requires verified email |
+| `PENDING_SETUP` | `ACTIVE` | Username assigned + finish | Requires valid username |
+| `ACTIVE` | `SUSPENDED` | Moderation action | Revoke sessions |
+| `SUSPENDED` | `ACTIVE` | Moderation reinstate | User can log in again |
+| `ACTIVE` | `PENDING_DELETION` | User requests deletion | Revoke sessions, insert deletion request |
+| `PENDING_DELETION` | `ACTIVE` | Recovery within 20 days | Requires valid recovery token |
+| `PENDING_DELETION` | `DEACTIVATED` | 20 days elapsed | Scheduler; anonymize + tombstone |
+| `SUSPENDED` | `DEACTIVATED` | (Optional) long-term moderation | Product decision |
+
+**This is a domain model, not a requirement to store every state in a separate table.**
+
+## 2.4 Optional profile behavior
+
+Split profile requirements into two groups:
+
+**Mandatory to activate:**
+- First name and last name (if required by product).
+- Verified email.
+- Password for local-password accounts, or a valid linked identity for Google-only accounts.
+- Unique username.
+
+**Optional and editable later:**
+- Avatar.
+- Bio.
+- Additional profile information introduced later.
+
+> If a user skips avatar and bio, the backend **must still activate** the account after mandatory steps. Do **not** require avatar URL or bio to be non-null before activation.
+
+---
+
+# 3. REST API contract — complete endpoint inventory
+
+Prefix: `/api/v1`. JSON bodies. UTC timestamps. UUID resource identifiers. Consistent error responses.
+
+## 3.1 Registration and OTP
+
+| Method | Endpoint | Authentication | Purpose |
+|---|---|---|---|
+| `POST` | `/api/v1/auth/registrations` | Public, rate-limited | Start registration and send OTP |
+| `POST` | `/api/v1/auth/registrations/{id}/otp/resend` | Challenge credential | Resend OTP with cooldown |
+| `POST` | `/api/v1/auth/registrations/{id}/otp/verify` | Challenge credential | Verify OTP |
+| `POST` | `/api/v1/auth/registrations/{id}/complete` | Verified challenge | Create pending account |
+| `GET` | `/api/v1/auth/registrations/{id}` | Challenge credential | Resume registration, inspect next step |
+| `POST` | `/api/v1/auth/registrations/{id}/username` | Registration credential | Set initial username |
+| `POST` | `/api/v1/auth/registrations/{id}/finish` | Registration credential | Finish setup and activate account |
+
+**Security note:** The `{id}` is a random registration-challenge identifier, **not a secret**. Protect it with a separate high-entropy challenge credential in an `HttpOnly` cookie (web) or an opaque credential held securely by a native client. **A guessed UUID must not be enough to modify registration.**
+
+## 3.2 Login and sessions
+
+| Method | Endpoint | Authentication | Purpose |
+|---|---|---|---|
+| `POST` | `/api/v1/auth/login` | Public, rate-limited | Local login |
+| `POST` | `/api/v1/auth/refresh` | Valid refresh credential | Rotate refresh token, issue access token |
+| `POST` | `/api/v1/auth/logout` | Authenticated | Revoke current session |
+| `POST` | `/api/v1/auth/logout-all` | Authenticated | Revoke all sessions |
+| `GET` | `/api/v1/auth/me` | Valid access token | Current user |
+| `GET` | `/api/v1/auth/sessions` | Valid access token | List active sessions |
+| `DELETE` | `/api/v1/auth/sessions/{sessionId}` | Valid access token | Revoke a specific session |
+
+## 3.3 Google OAuth
+
+| Method | Endpoint | Authentication | Purpose |
+|---|---|---|---|
+| `GET` | `/oauth2/authorization/google` | Browser OAuth flow | Start Google sign-in |
+| `GET` | `/login/oauth2/code/google` | OAuth state / PKCE | Spring Security callback |
+| `POST` | `/api/v1/auth/google/native` | Public, token validation | Exchange native Google ID token for app session |
+| `POST` | `/api/v1/me/identities/google/link` | Authenticated + recent verification | Link Google to current account |
+| `DELETE` | `/api/v1/me/identities/google` | Authenticated + recent verification | Unlink Google safely |
+
+The Google callback is handled by **Spring Security**, not by a controller that trusts user-supplied email. Native sign-in must validate the ID token server-side, including signature, issuer, audience, expiration, and subject.
+
+## 3.4 Password and email recovery
+
+| Method | Endpoint | Authentication | Purpose |
+|---|---|---|---|
+| `POST` | `/api/v1/auth/password/forgot` | Public, rate-limited | Request password-reset OTP |
+| `POST` | `/api/v1/auth/password/reset/verify` | Reset challenge | Verify OTP, issue limited reset permission |
+| `POST` | `/api/v1/auth/password/reset` | Reset credential | Set new password |
+| `POST` | `/api/v1/auth/password/change` | Authenticated + current password | Change password while signed in |
+| `POST` | `/api/v1/auth/email/change` | Authenticated + recent verification | Start email change |
+| `POST` | `/api/v1/auth/email/change/verify` | Email-change challenge | Verify new email and commit change |
+
+> Use **separate challenge purposes** for registration, password reset, email change, and account deletion recovery. A registration OTP must **never** authorize a password reset.
+
+## 3.5 Profile and username
+
+| Method | Endpoint | Authentication | Purpose |
+|---|---|---|---|
+| `GET` | `/api/v1/me/profile` | Access token | Read current profile |
+| `PATCH` | `/api/v1/me/profile` | Access token | Update name or bio |
+| `PUT` | `/api/v1/me/profile/avatar` | Access token | Set avatar asset reference |
+| `DELETE` | `/api/v1/me/profile/avatar` | Access token | Remove avatar |
+| `POST` | `/api/v1/me/username` | Access token | Set initial username |
+| `PATCH` | `/api/v1/me/username` | Access token | Change username under 30-day policy |
+| `GET` | `/api/v1/username/available?username=mohan_dev` | Public, rate-limited | Check username availability |
+
+The availability endpoint is **advisory only**. A username can become unavailable between checking and saving. The database uniqueness constraint is the final authority.
+
+For a public chat application, the authenticated user **cannot** choose another user's ID as the owner of a profile update. Derive the current user ID from the security principal.
+
+## 3.6 User blocking
+
+| Method | Endpoint | Authentication | Purpose |
+|---|---|---|---|
+| `POST` | `/api/v1/me/blocks` | Access token + `ACTIVE` | Block a user |
+| `DELETE` | `/api/v1/me/blocks/{blockedUserId}` | Access token + `ACTIVE` | Unblock a user |
+| `GET` | `/api/v1/me/blocks` | Access token + `ACTIVE` | List users I blocked (paginated) |
+| `GET` | `/api/v1/me/blocks/status/{userId}` | Access token + `ACTIVE` | Check block relationship |
+
+**Blocking is directional.** A blocks B; B is not blocked by A unless B also blocks A.
+
+## 3.7 Account deletion and recovery
+
+| Method | Endpoint | Authentication | Purpose |
+|---|---|---|---|
+| `POST` | `/api/v1/me/deletion` | Access token + `ACTIVE` + password re-entry | Request account deletion |
+| `GET` | `/api/v1/me/deletion` | Access token + `ACTIVE` or `PENDING_DELETION` | Check current deletion request |
+| `POST` | `/api/v1/auth/deletion/recover` | Public, rate-limited, recovery token | Recover within 20 days |
+| `POST` | `/api/v1/auth/deletion/status` | Public, rate-limited, generic response | Check if an email is recoverable |
+
+**Critical:** Recovery **cannot** require an access token because the user's sessions are revoked when deletion is requested. Recovery uses an **email-delivered one-time token**.
+
+---
+
+# 4. Modular monolith project structure
+
+Organize by **business capability**, not by a single global controller/service/repository containing every feature.
+
+## 4.1 Recommended folder structure
+
+```
+chat-backend/
+├── pom.xml
+├── Dockerfile
+├── compose.yaml
+├── .env.example
+├── .gitignore
+├── README.md
+├── docs/
+│   ├── authentication.md
+│   ├── api-contract.md
+│   ├── security.md
+│   ├── blocking-and-deletion.md
+│   └── postman-testing.md
+└── src/
+    ├── main/
+    │   ├── java/com/example/chat/
+    │   │   ├── ChatApplication.java
+    │   │   ├── auth/
+    │   │   │   ├── api/
+    │   │   │   │   ├── RegistrationController.java
+    │   │   │   │   ├── AuthenticationController.java
+    │   │   │   │   ├── PasswordRecoveryController.java
+    │   │   │   │   └── EmailChangeController.java
+    │   │   │   ├── application/
+    │   │   │   │   ├── RegistrationService.java
+    │   │   │   │   ├── LoginService.java
+    │   │   │   │   ├── TokenRefreshService.java
+    │   │   │   │   ├── LogoutService.java
+    │   │   │   │   ├── PasswordRecoveryService.java
+    │   │   │   │   └── AccountActivationService.java
+    │   │   │   └── dto/
+    │   │   │       ├── RegistrationStartRequest.java
+    │   │   │       ├── OtpVerifyRequest.java
+    │   │   │       ├── RegistrationCompleteRequest.java
+    │   │   │       ├── LoginRequest.java
+    │   │   │       ├── TokenResponse.java
+    │   │   │       └── ...
+    │   │   ├── identity/
+    │   │   │   ├── application/
+    │   │   │   │   ├── GoogleLoginService.java
+    │   │   │   │   ├── IdentityLinkingService.java
+    │   │   │   │   └── PasswordIdentityService.java
+    │   │   │   └── domain/
+    │   │   │       ├── UserIdentity.java
+    │   │   │       ├── IdentityProvider.java
+    │   │   │       └── UserIdentityRepository.java
+    │   │   ├── profile/
+    │   │   │   ├── api/
+    │   │   │   │   ├── MyProfileController.java
+    │   │   │   │   └── UsernameController.java
+    │   │   │   ├── application/
+    │   │   │   │   ├── ProfileService.java
+    │   │   │   │   └── UsernameService.java
+    │   │   │   └── domain/
+    │   │   │       ├── UserProfile.java
+    │   │   │       └── UserProfileRepository.java
+    │   │   ├── session/
+    │   │   │   ├── application/
+    │   │   │   │   ├── SessionService.java
+    │   │   │   │   └── RefreshTokenService.java
+    │   │   │   └── domain/
+    │   │   │       ├── UserSession.java
+    │   │   │       └── UserSessionRepository.java
+    │   │   ├── verification/
+    │   │   │   ├── application/
+    │   │   │   │   ├── OtpService.java
+    │   │   │   │   └── RegistrationChallengeService.java
+    │   │   │   └── domain/
+    │   │   │       ├── RegistrationChallenge.java
+    │   │   │       ├── OtpChallenge.java
+    │   │   │       └── ChallengePurpose.java
+    │   │   ├── block/
+    │   │   │   ├── api/
+    │   │   │   │   └── BlockController.java
+    │   │   │   ├── application/
+    │   │   │   │   ├── BlockService.java
+    │   │   │   │   └── BlockQueryService.java
+    │   │   │   ├── domain/
+    │   │   │   │   ├── UserBlock.java
+    │   │   │   │   └── UserBlockRepository.java
+    │   │   │   └── dto/
+    │   │   │       ├── BlockUserRequest.java
+    │   │   │       ├── BlockResponse.java
+    │   │   │       └── BlockStatusResponse.java
+    │   │   ├── account/
+    │   │   │   ├── api/
+    │   │   │   │   └── AccountDeletionController.java
+    │   │   │   ├── application/
+    │   │   │   │   ├── AccountDeletionService.java
+    │   │   │   │   ├── AccountRecoveryService.java
+    │   │   │   │   └── AccountDeletionScheduler.java
+    │   │   │   ├── domain/
+    │   │   │   │   ├── AccountDeletionRequest.java
+    │   │   │   │   ├── AccountDeletionRequestRepository.java
+    │   │   │   │   ├── DeletedUserIdentity.java
+    │   │   │   │   └── DeletedUserIdentityRepository.java
+    │   │   │   └── dto/
+    │   │   │       ├── DeletionRequestRequest.java
+    │   │   │       ├── DeletionRequestResponse.java
+    │   │   │       ├── RecoveryRequest.java
+    │   │   │       └── RecoveryResponse.java
+    │   │   ├── notification/
+    │   │   │   ├── application/
+    │   │   │   │   ├── EmailTemplateService.java
+    │   │   │   │   └── EmailOutboxService.java
+    │   │   │   ├── infrastructure/
+    │   │   │   │   └── BrevoEmailSender.java
+    │   │   │   └── domain/
+    │   │   │       └── EmailOutboxEvent.java
+    │   │   ├── rate_limit/
+    │   │   │   ├── RateLimitService.java
+    │   │   │   └── RedisRateLimitRepository.java
+    │   │   ├── audit/
+    │   │   │   ├── SecurityAuditService.java
+    │   │   │   └── domain/SecurityAuditEvent.java
+    │   │   └── common/
+    │   │       ├── security/
+    │   │       │   ├── SecurityConfig.java
+    │   │       │   ├── JwtAuthenticationConverter.java
+    │   │       │   ├── JwtTokenService.java
+    │   │       │   ├── CurrentUser.java
+    │   │       │   └── AccountStatusGuard.java
+    │   │       ├── error/
+    │   │       │   ├── GlobalExceptionHandler.java
+    │   │       │   ├── ApiError.java
+    │   │       │   └── ErrorCode.java
+    │   │       ├── util/
+    │   │       │   ├── HmacUtil.java
+    │   │       │   ├── SecureRandomUtil.java
+    │   │       │   └── NormalizationUtil.java
+    │   │       └── config/
+    │   │           ├── RedisConfig.java
+    │   │           ├── JacksonConfig.java
+    │   │           ├── AppProperties.java
+    │   │           └── SchedulingConfig.java
+    │   └── resources/
+    │       ├── application.yml
+    │       ├── application-local.yml
+    │       ├── application-prod.yml
+    │       ├── db/migration/
+    │       │   ├── V1__create_users.sql
+    │       │   ├── V2__create_user_profiles.sql
+    │       │   ├── V3__create_user_identities.sql
+    │       │   ├── V4__create_user_sessions.sql
+    │       │   ├── V5__create_registration_and_otp_challenges.sql
+    │       │   ├── V6__create_email_outbox.sql
+    │       │   ├── V7__add_pending_deletion_status.sql
+    │       │   ├── V8__create_user_blocks.sql
+    │       │   ├── V9__create_account_deletion_requests.sql
+    │       │   ├── V10__create_deleted_user_identities.sql
+    │       │   └── V11__add_block_and_deletion_indexes.sql
+    │       └── templates/email/
+    │           ├── registration-otp.html
+    │           ├── password-reset-otp.html
+    │           ├── welcome.html
+    │           ├── deletion-requested.html
+    │           ├── deletion-recovery.html
+    │           └── deletion-completed.html
+    └── test/java/com/example/chat/
+        ├── unit/
+        ├── integration/
+        └── concurrency/
+```
+
+## 4.2 What each module owns
+
+| Module | Responsibilities |
+|---|---|
+| `auth` | Registration orchestration, local login, logout, refresh, password recovery, email change |
+| `identity` | Local-password identity, Google identity, linking and unlinking |
+| `profile` | First name, last name, username, bio, avatar metadata |
+| `session` | Refresh-token storage, rotation, device info, session revocation |
+| `verification` | OTP generation, challenge state, expiry, verification rules |
+| `block` | Directional user blocking, block queries |
+| `account` | Deletion requests, recovery, permanent deletion scheduler, tombstones |
+| `notification` | Brevo integration, email templates, retry handling, welcome emails |
+| `rate_limit` | Redis-based limits for public and authenticated operations |
+| `audit` | Security event recording without secrets |
+| `common.security` | Security filters, authentication principal, authorization helpers |
+| `common.error` | Consistent API errors and exception handling |
+
+## 4.3 Application layer rules
+
+A controller validates the request format and delegates business work to an application service. It should **not** contain OTP algorithms, password checks, refresh-token rotation logic, or direct Redis scripting.
+
+**Typical request path:**
+
+```
+HTTP Request
+   → Controller (validation, DTO mapping)
+   → Application Service (workflow coordination)
+   → Domain Rules (invariants)
+   → Repository / Infrastructure (PostgreSQL, Redis, External Provider)
+```
+
+**Avoid circular dependencies.** For example, the `profile` module should not call the `auth` controller. Both modules can use an application-level `AccountService` or explicit module interface.
+
+**Never serialize JPA entities directly as API responses.** Use DTOs such as `RegistrationStartRequest`, `OtpVerifyRequest`, `LoginRequest`, `TokenResponse`, `ProfileResponse`, `BlockResponse`, `DeletionRequestResponse`.
+
+---
+
+# 5. PostgreSQL schema and data model
+
+PostgreSQL is the **source of truth** for permanent user accounts, authentication identities, refresh sessions, blocks, and deletion state. Deleting or restarting Redis must **not** delete users or permanently invalidate the database's record of account ownership.
+
+## 5.1 `users` table
+
+```sql
+CREATE TABLE users (
+    id UUID PRIMARY KEY,
+    email_normalized VARCHAR(320) NOT NULL,
+    email_verified_at TIMESTAMPTZ,
+    date_of_birth DATE,
+    first_name VARCHAR(100) NOT NULL,
+    last_name VARCHAR(100) NOT NULL,
+    status VARCHAR(30) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_users_email UNIQUE (email_normalized),
+    CONSTRAINT chk_users_status CHECK (
+        status IN (
+            'PENDING_SETUP',
+            'ACTIVE',
+            'SUSPENDED',
+            'PENDING_DELETION',
+            'DEACTIVATED'
+        )
+    )
+);
+```
+
+**Important decisions:**
+
+- Normalize email consistently **before** lookup and uniqueness checks.
+- Do **not** lowercase the entire email domain and local part without a defined product policy. Email local-part handling can vary.
+- Define the required date-of-birth policy and avoid retaining more personal information than necessary.
+- If local password credentials are optional for Google-only accounts, keep passwords in a **separate identity or credential table** rather than requiring a `password` column on every user.
+- Use database migrations rather than modifying production schemas manually.
+
+## 5.2 `user_profiles` table
+
+```sql
+CREATE TABLE user_profiles (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    username VARCHAR(30),
+    username_normalized VARCHAR(30),
+    bio VARCHAR(500),
+    avatar_public_id VARCHAR(255),
+    username_changed_at TIMESTAMPTZ,
+    profile_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_profile_username UNIQUE (username_normalized)
+);
+```
+
+A profile row **can exist** even when the user has not chosen an avatar or bio.
+
+For mandatory usernames, use `NULL` only during setup. The activation service **must** ensure a non-null, valid username before changing the account to `ACTIVE`. You may enforce this at the application layer initially, or use a deferred database constraint or trigger if you want the database to enforce the cross-table invariant.
+
+> For a simpler initial design, you could keep the username on `users`. A separate profile table is preferred because profile creation is optional and independently editable.
+
+## 5.3 `user_identities` table
+
+A user can have more than one way to authenticate.
+
+```sql
+CREATE TABLE user_identities (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider VARCHAR(30) NOT NULL,
+    provider_subject VARCHAR(255) NOT NULL,
+    password_hash TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_provider_subject UNIQUE (provider, provider_subject),
+    CONSTRAINT chk_identity_provider CHECK (provider IN ('LOCAL', 'GOOGLE'))
+);
+```
+
+- For local login, use a provider subject based on a stable internal identifier or a normalized login identifier.
+- If you allow login by **both** email and username, resolve the login identifier to the user first, then verify the local password.
+- For Google, `provider_subject` holds the stable Google `sub` value. **Never use an email address as the Google identity's primary key.**
+- An alternative is to split local credentials and external identities into separate tables for stricter separation of authentication secrets.
+
+## 5.4 `user_sessions` table
+
+```sql
+CREATE TABLE user_sessions (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    refresh_token_hash VARCHAR(255) NOT NULL UNIQUE,
+    device_name VARCHAR(150),
+    client_type VARCHAR(30) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    replaced_by_session_id UUID REFERENCES user_sessions(id),
+
+    CONSTRAINT chk_client_type CHECK (
+        client_type IN ('WEB', 'ANDROID', 'IOS', 'DESKTOP')
+    )
+);
+
+CREATE INDEX idx_user_sessions_user_active
+    ON user_sessions(user_id, expires_at)
+    WHERE revoked_at IS NULL;
+```
+
+A refresh-token rotation implementation may use a stable session ID plus a separate token-family or token-generation table. For token reuse detection, track token generations or retain hashed identifiers of recently rotated tokens long enough to detect replay. **Revoke the affected token family or session and require authentication again when a replay is confirmed.**
+
+## 5.5 Registration and OTP challenges
+
+```sql
+CREATE TABLE registration_challenges (
+    id UUID PRIMARY KEY,
+    email_lookup VARCHAR(255) NOT NULL,
+    status VARCHAR(30) NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    verified_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE otp_challenges (
+    id UUID PRIMARY KEY,
+    registration_id UUID REFERENCES registration_challenges(id),
+    user_id UUID REFERENCES users(id),
+    purpose VARCHAR(30) NOT NULL,
+    otp_hash VARCHAR(255) NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    consumed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_otp_active
+    ON otp_challenges(registration_id, purpose, expires_at)
+    WHERE consumed_at IS NULL;
+```
+
+**OTP security:** A hash alone does not solve all OTP security problems — OTPs have low entropy, so a database leak can make brute-force attempts feasible. Use a **keyed HMAC with a server-side secret**, short expiry, strict attempt limits, and one-time consumption.
+
+## 5.6 `email_outbox` table
+
+For reliable email delivery, use a transactional outbox.
+
+```sql
+CREATE TABLE email_outbox (
+    id UUID PRIMARY KEY,
+    recipient VARCHAR(320) NOT NULL,
+    template VARCHAR(100) NOT NULL,
+    payload JSONB NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sent_at TIMESTAMPTZ,
+
+    CONSTRAINT chk_outbox_status CHECK (
+        status IN ('PENDING', 'SENT', 'FAILED', 'DEAD_LETTER')
+    )
+);
+
+CREATE INDEX idx_outbox_pending
+    ON email_outbox(created_at)
+    WHERE status = 'PENDING';
+```
+
+In a transaction, save the challenge **and** an email-outbox event. A background worker sends the email and marks the event complete. This avoids losing an email when the application crashes after committing the challenge but before sending the email.
+
+## 5.7 `user_blocks` table
+
+```sql
+CREATE TABLE user_blocks (
+    id UUID PRIMARY KEY,
+    blocker_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    blocked_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reason VARCHAR(255),
+
+    CONSTRAINT uq_user_block UNIQUE (blocker_user_id, blocked_user_id),
+    CONSTRAINT chk_no_self_block CHECK (blocker_user_id <> blocked_user_id)
+);
+
+CREATE INDEX idx_user_blocks_blocked ON user_blocks(blocked_user_id);
+CREATE INDEX idx_user_blocks_blocker ON user_blocks(blocker_user_id);
+```
+
+**Production notes:**
+
+- `ON DELETE CASCADE` on both FKs so hard-deleting a user removes their blocks automatically.
+- The unique constraint prevents duplicate blocks; the service should treat a duplicate as **idempotent success**.
+- Do **not** store block state in Redis as source of truth — it is permanent relational data.
+- Consider a partial index or a materialized view for "is user X blocked by anyone" checks in the chat module.
+
+## 5.8 `account_deletion_requests` table
+
+```sql
+CREATE TABLE account_deletion_requests (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id),
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    recoverable_until TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    reason VARCHAR(500),
+    status VARCHAR(30) NOT NULL,
+    recovery_token_hash VARCHAR(255),
+    recovery_token_expires_at TIMESTAMPTZ,
+
+    CONSTRAINT chk_deletion_status CHECK (
+        status IN ('PENDING', 'RECOVERED', 'COMPLETED', 'CANCELLED')
+    )
+);
+
+CREATE UNIQUE INDEX uq_active_deletion_request
+    ON account_deletion_requests(user_id)
+    WHERE status = 'PENDING';
+```
+
+**Why a separate table:**
+
+- Audit trail: you know when a user asked, why, and whether they recovered.
+- `recoverable_until` is explicit and queryable (used by the scheduler).
+- The partial unique index enforces "only one active deletion request per user" at the database level.
+- Recovery token hash and expiry are stored here — the plaintext token is only ever sent via email.
+
+## 5.9 `deleted_user_identities` table (tombstones)
+
+When a user is permanently deleted after 20 days, you must **not** reuse their email or username, or an attacker could register the old email and impersonate them via password reset.
+
+```sql
+CREATE TABLE deleted_user_identities (
+    id UUID PRIMARY KEY,
+    original_user_id UUID NOT NULL,
+    email_hash VARCHAR(255) NOT NULL,
+    username_normalized VARCHAR(30),
+    deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_deleted_identity_email_hash
+    ON deleted_user_identities(email_hash);
+```
+
+**Rules:**
+
+- Registration checks `deleted_user_identities` before allowing a new account with the same email.
+- The tombstone is HMAC'd with `IDENTIFIER_HMAC_KEY_BASE64` — **never** store plaintext deleted emails.
+- Username tombstones are optional; a product decision. If you want "vanity username protection," keep them.
+
+## 5.10 Database transaction boundaries
+
+The following operations should be **transactional**:
+
+- Create account and initial profile row.
+- Claim a username and update the username-change timestamp.
+- Rotate a refresh token and update the session record.
+- Change a password and revoke refresh sessions.
+- Link an external identity after checking ownership and uniqueness.
+- Activate an account after mandatory registration steps are complete.
+- **Request account deletion** (set status, revoke sessions, insert deletion request).
+- **Recover account** (set status to `ACTIVE`, mark request `RECOVERED`, create session).
+- **Complete permanent deletion** (tombstone, anonymize, mark request `COMPLETED`).
+- **Create a block** (insert `user_blocks` row).
+
+Redis and Brevo are external systems, so PostgreSQL transactions **cannot atomically commit an email send or a Redis operation**. Use idempotency, explicit challenge states, and — for reliable notifications — a transactional outbox.
+
+---
+
+# 6. Redis architecture — detailed implementation
+
+Redis is **not** just a cache in this project. It is a shared, low-latency store for temporary state and distributed coordination.
+
+For the authentication module, use it for:
+
+1. Rate limiting.
+2. OTP send cooldowns and attempt limits.
+3. Temporary registration state (if you choose to keep it in Redis).
+4. Temporary password-reset challenges.
+5. Short-lived security flags or replay-detection state.
+
+Later, your real-time chat system can use Redis for presence, distributed WebSocket events, and synchronization between backend instances.
+
+## 6.1 Redis vs. PostgreSQL
+
+| Data | PostgreSQL | Redis |
+|---|---|---|
+| Permanent user account | Source of truth | Optional cache only |
+| Password hash | Source of truth | Never needed |
+| Google identity link | Source of truth | Optional short-lived cache |
+| Refresh-session revocation | Source of truth | Optional acceleration, not sole authority |
+| User blocks | **Source of truth** | Never cache as authority |
+| Account deletion request | **Source of truth** | Never cache as authority |
+| Deletion recovery token | Source of truth (hash) | Never |
+| OTP challenge | Durable challenge record if required | Temporary state, counters, expiry |
+| Rate-limit counters | Usually unnecessary | **Primary implementation** |
+| Registration cooldown | Durable or temporary | Useful |
+| Username uniqueness | Enforced with a database constraint | Cache only, never authoritative |
+| Online presence | Not ideal | Excellent fit |
+| WebSocket event fan-out | Durable events may be stored elsewhere | Pub/Sub or Streams |
+
+> For account security, **do not treat a cache hit as proof of identity**. A cache miss must not let a revoked session become valid again.
+
+## 6.2 Redis key naming conventions
+
+Use a clear prefix so keys are understandable and don't collide with unrelated features.
+
+| Key pattern | Purpose | Example TTL |
+|---|---|---|
+| `chat:rl:registration:ip:{hash}` | Registration requests by IP | 15 min |
+| `chat:rl:otp:send:{email-hmac}` | OTP send limit per email | 15 min |
+| `chat:cooldown:otp:{challenge-id}` | Resend cooldown | 60 sec |
+| `chat:rl:otp:verify:{challenge-id}` | OTP verification attempts | Challenge lifetime |
+| `chat:rl:login:account:{account-hmac}` | Failed-login throttling | 15 min |
+| `chat:rl:login:ip:{hash}` | Login request throttling | 15 min |
+| `chat:rl:password-reset:{account-hmac}` | Password-reset throttling | 15 min |
+| `chat:registration:{challenge-id}` | Temporary registration state (if Redis-backed) | Challenge lifetime |
+| `chat:password-reset:{challenge-id}` | Temporary reset state | Short reset lifetime |
+| `chat:rl:block:{actor-hmac}` | Blocking operations | 1 hour |
+| `chat:rl:deletion:request:{user-hmac}` | Deletion requests per user | 24 hours |
+| `chat:rl:deletion:recover:{token-hmac}` | Recovery attempts | 1 hour |
+| `chat:rl:deletion:status:{ip-hash}` | Deletion status checks | 1 hour |
+
+**TTL is the maximum retention for temporary data, not a replacement for checking the challenge's actual expiry timestamp.**
+
+**Never** put a raw email address, password, OTP, access token, refresh token, or recovery token into Redis key names. Use an HMAC of normalized identifiers. For IP keys, consider privacy-conscious hashing or short retention.
+
+## 6.3 Implement rate limiting atomically
+
+A common mistake:
+
+```
+GET counter
+if counter < limit:
+    INCR counter
+```
+
+Two simultaneous requests can both observe the same counter and exceed the limit.
+
+Use an **atomic** Redis operation or Lua script to check the limit **and** increment in a single operation. Ensure the first increment sets the expiry, and subsequent increments do not accidentally extend the window unless your chosen algorithm requires it.
+
+### Fixed-window rate limiter
+
+```
+key = chat:rl:otp:send:<email-hmac>
+
+Atomically:
+  if key does not exist:
+      set counter = 1
+      set expiry = 15 minutes
+  else:
+      increment counter
+  if counter exceeds the allowed limit:
+      reject request with 429
+```
+
+The implementation **must** check the limit and increment atomically. A separate `INCR` followed by `EXPIRE` can leave a counter without an expiry if the application crashes between operations.
+
+A fixed window can permit bursts around window boundaries. For login and OTP endpoints, you can later move to a token bucket or sliding-window algorithm if the risk and traffic justify it.
+
+### Example Redis Lua script
+
+```lua
+-- KEYS[1] = rate-limit key
+-- ARGV[1] = limit
+-- ARGV[2] = window duration in milliseconds
+
+local count = redis.call("INCR", KEYS[1])
+if count == 1 then
+    redis.call("PEXPIRE", KEYS[1], ARGV[2])
+end
+local ttl = redis.call("PTTL", KEYS[1])
+if count > tonumber(ARGV[1]) then
+    return {0, count, ttl}
+end
+return {1, count, ttl}
+```
+
+This is an **illustrative** fixed-window script. Production code must validate inputs, handle Redis errors, interpret the result consistently, and avoid accepting negative or invalid limits. Map a denied result to `429 Too Many Requests` with a sensible `Retry-After` header.
+
+## 6.4 Where rate limiting should happen
+
+Apply limits at more than one layer:
+
+- **Edge / reverse proxy:** connection limits, request size, coarse IP throttling.
+- **Spring Security or request filter:** broad public endpoint limits.
+- **Application service:** operation-specific limits such as OTP sends, password resets, blocks, and deletion requests.
+- **External provider limits:** respect Brevo's account quotas and email sending rules.
+
+**Do not rate-limit every authenticated API with the same policy.** Changing a profile bio is not the same risk as requesting an OTP or attempting a password login.
+
+For login, combine **account-based** and **IP-based** throttling. Account-based limits prevent distributed attacks against a single account; IP limits reduce rapid abuse from one source. Return **generic** errors so a rate-limit response does not unnecessarily reveal whether an email belongs to a registered account.
+
+## 6.5 OTP state and concurrency
+
+For an OTP challenge, enforce **all** of these conditions:
+
+1. The challenge exists.
+2. It belongs to the correct registration, user, or reset attempt.
+3. Its purpose matches the operation.
+4. It has not expired.
+5. It has not already been consumed.
+6. Its attempt limit has not been exceeded.
+7. The supplied code matches the expected code securely.
+8. The challenge is consumed **exactly once**.
+
+Use an **atomic state transition** or database transaction to prevent two simultaneous requests from consuming the same OTP successfully.
+
+For a Redis-backed OTP, use a Lua script or equivalent atomic operation for attempt counting and state changes. If the OTP challenge is **also** persisted in PostgreSQL, define which system owns the final consumption decision. **Do not allow Redis and database states to disagree silently.**
+
+For high-value transitions such as password reset, PostgreSQL should remain the authoritative record of completion and token revocation.
+
+## 6.6 Redis deployment and failure behavior
+
+**For production:**
+
+- Require authentication and network isolation.
+- Use TLS when Redis traffic crosses untrusted networks.
+- Avoid exposing Redis to the public internet.
+- Configure memory limits and an eviction policy suitable for temporary state.
+- Monitor memory usage, latency, rejected connections, and expired keys.
+- Use a managed Redis service or a carefully configured deployment.
+- Test behavior during failover and Redis unavailability.
+- **Fail closed** for sensitive rate limits. If Redis is unavailable, do not silently allow unlimited OTP sends and login attempts. Return a temporary service error or apply a safe fallback at the edge.
+
+**Redis should not be your only source of refresh-token revocation, account status, block state, deletion state, or durable authentication identity.**
+
+---
+
+# 7. OTP verification with Brevo
+
+Brevo is the email delivery provider. **Your backend is responsible for generating, validating, expiring, and consuming OTPs.**
+
+## 7.1 Registration OTP lifecycle
+
+```
+Client                Spring Boot              PostgreSQL           Redis              Brevo
+  │                       │                       │                  │                  │
+  │  POST /registrations  │                       │                  │                  │
+  ├──────────────────────►│                       │                  │                  │
+  │                       │  Check rate limits    │                  │                  │
+  │                       ├───────────────────────┼─────────────────►│                  │
+  │                       │                       │                  │                  │
+  │                       │  Create challenge     │                  │                  │
+  │                       ├──────────────────────►│                  │                  │
+  │                       │                       │                  │                  │
+  │                       │  Store OTP hash       │                  │                  │
+  │                       ├──────────────────────►│                  │                  │
+  │                       │                       │                  │                  │
+  │                       │  Enqueue outbox email │                  │                  │
+  │                       ├──────────────────────►│                  │                  │
+  │                       │                       │                  │                  │
+  │  Challenge ID + expiry│                       │                  │                  │
+  │◄──────────────────────┤                       │                  │                  │
+  │                       │                       │                  │                  │
+  │                       │  (background worker)  │                  │                  │
+  │                       ├───────────────────────┼──────────────────┼─────────────────►│
+  │                       │                       │                  │                  │
+  │                       │                       │                  │  Send OTP email  │
+  │                       │                       │                  │                  │
+  │  POST /otp/verify     │                       │                  │                  │
+  ├──────────────────────►│                       │                  │                  │
+  │                       │  Check attempt limit  │                  │                  │
+  │                       ├───────────────────────┼─────────────────►│                  │
+  │                       │                       │                  │                  │
+  │                       │  Validate + consume   │                  │                  │
+  │                       ├──────────────────────►│                  │                  │
+  │                       │                       │                  │                  │
+  │  Verification success │                       │                  │                  │
+  │◄──────────────────────┤                       │                  │                  │
+```
+
+The example shows the logical sequence. Your implementation must account for **delivery failures** and **concurrent requests**.
+
+### Generate the OTP
+
+- Generate a cryptographically secure numeric code using `java.security.SecureRandom`.
+- A six-digit code is a common user-friendly choice, but because it has limited entropy, it requires a short lifetime, strong rate limits, and attempt restrictions.
+- **Store a keyed HMAC of the OTP, not the plaintext OTP.** Include the challenge identifier and purpose in the HMAC input to prevent the same code representation from being reused across contexts.
+
+```
+otp_hash = HMAC(OTP_HMAC_SECRET, challenge_id + ":" + purpose + ":" + otp)
+```
+
+- Use **constant-time comparison** where applicable.
+
+### Send the email
+
+The backend should:
+
+1. Generate and persist the challenge.
+2. Save an **email-outbox event** in the same transaction.
+3. A background worker attempts to send the email through Brevo.
+4. Mark the delivery state or record a retryable notification job.
+5. Return a **generic** response that does not reveal whether an account exists.
+
+**Never** put the OTP into application logs, exception messages, tracing spans, or analytics events.
+
+## 7.2 OTP resend rules
+
+**Recommended initial policy:**
+
+- One OTP valid for **5 minutes**.
+- A **60-second** resend cooldown.
+- A limit on sends per email **and** IP.
+- A maximum number of verification attempts (**5**).
+- Invalidate or supersede previous codes when a new code is issued.
+- Do **not** extend an old challenge indefinitely by repeatedly resending.
+- Make resends idempotent when a client retries after a network timeout, where feasible.
+
+These are **configurable product policies**, not universal security standards.
+
+## 7.3 Forgot password
+
+Use a different challenge purpose, such as `PASSWORD_RESET`.
+
+The reset flow should **not** return a general access token. After successful OTP verification, issue a **limited reset credential** that can only authorize the password-reset operation. It must expire quickly, be single-use, and be bound to the intended account and challenge.
+
+**After setting a new password:**
+
+- Revoke refresh sessions.
+- Invalidate outstanding password-reset challenges.
+- Notify the account owner.
+- Avoid logging the new password or reset credential.
+- Require normal login again unless you deliberately design and security-review an explicit session-creation flow.
+
+---
+
+# 8. Authentication strategy: access tokens, refresh tokens, and cookies
+
+Three important requirements:
+
+1. A web browser should use **secure cookies**.
+2. Native applications should use **native secure storage**.
+3. Every client should share the **same identity and authorization rules**.
+
+**Recommended design:** short-lived access tokens with server-tracked, opaque refresh tokens.
+
+## 8.1 Access token
+
+A JWT access token can contain:
+
+```json
+{
+  "iss": "https://api.example.com",
+  "aud": "chat-api",
+  "sub": "user-uuid",
+  "sid": "session-uuid",
+  "iat": 1790000000,
+  "exp": 1790000600,
+  "jti": "unique-token-id"
+}
+```
+
+This is an illustrative payload, **not** a valid production token.
+
+**Claims should be minimal.** Never include passwords, OTPs, refresh tokens, or unnecessary personal information. Use a standard JWT library and validate the signature, issuer, audience, expiry, and allowed algorithm.
+
+The `sid` identifies the session, so the backend can reject tokens associated with revoked sessions if you choose to check session state on each request. Without such a check, a stateless access token generally remains valid until expiry, even after logout.
+
+For this application, a **short access-token lifetime** limits that residual exposure. If immediate revocation is a strict requirement, introduce a deliberate session-revocation check or opaque access tokens.
+
+## 8.2 Refresh token
+
+- Generate a high-entropy random token using a cryptographically secure random generator.
+- The refresh token should **not** be a JWT just because the access token is one.
+- **Store a hash** of the refresh token in PostgreSQL.
+
+**On refresh:**
+
+1. Read the refresh token from the appropriate client credential location.
+2. Calculate the lookup hash.
+3. Find the session and verify status and expiry.
+4. **Atomically rotate** the refresh credential.
+5. Return a new access token and refresh credential.
+6. **Detect reuse** of a previously rotated token and revoke the affected session or token family according to policy.
+
+Use a transaction or another carefully designed atomic protocol to prevent concurrent refresh requests from successfully rotating the same credential twice.
+
+## 8.3 Browser cookies
+
+For the React website, set a refresh cookie with:
+
+```
+Set-Cookie: refresh_token=<opaque-token>;
+            HttpOnly;
+            Secure;
+            SameSite=Lax;
+            Path=/api/v1/auth
+```
+
+- Use a **host-only** cookie unless a wider domain scope is genuinely required.
+- Set `Secure=true` in production and serve the entire application over HTTPS.
+- The frontend **cannot** read an `HttpOnly` cookie through JavaScript. That is intentional.
+
+For refresh requests, the browser must send credentials when required by your deployment. Configure CORS with an **explicit allowlist** of frontend origins and credentials. **Never combine credentialed CORS with a wildcard origin.**
+
+Cookie authentication also requires **CSRF protection**. Use an appropriate CSRF token mechanism for cookie-authenticated state-changing requests and configure `SameSite` deliberately. **Do not assume `SameSite` alone is sufficient for every deployment.**
+
+## 8.4 Native clients
+
+React Native applications should not rely on browser cookies as their only refresh mechanism.
+
+**A practical native flow:**
+
+1. Send the refresh token in a dedicated authentication request, for example through an `Authorization` scheme or a request body designed for that purpose.
+2. Store the token using **iOS Keychain** or **Android Keystore-backed storage** through a maintained secure-storage library.
+3. Keep the access token **in memory** where practical.
+4. Never embed a server secret in the mobile app.
+5. Revoke the native session on logout.
+
+> A native application is a **public client**. Do not ship a Google client secret or your own backend signing key inside the application.
+
+## 8.5 Keep me logged in
+
+Treat this as a request for a **longer session lifetime**. The backend determines the maximum refresh-session expiry.
+
+| Token | Example duration |
+|---|---|
+| Access token | 10 minutes |
+| Refresh token (default) | 7 days |
+| Refresh token (keep me logged in) | 30 days |
+| Refresh cookie (browser) | matches refresh token |
+| Deletion recovery token | 20 days |
+
+You can choose different durations after threat-model review. Every session should still be **revocable**, and longer-lived sessions should be clearly represented in the `user_sessions` table.
+
+---
+
+# 9. Google login and account linking
+
+The identity model must allow one user to have **both** local-password login and Google login.
+
+## 9.1 First Google login
+
+1. The user chooses **Continue with Google**.
+2. Spring Security starts the OAuth/OIDC flow for the web client.
+3. The provider authenticates the user and returns a validated identity.
+4. The backend identifies the account by the **stable provider subject**.
+5. If the identity is already linked, authenticate that account.
+6. If no link exists, decide whether a new account may be created or whether additional verification is needed.
+7. Create the application session **only after** the account policy is satisfied.
+
+If your registration policy requires date of birth and username for all accounts, a Google login that has not completed those steps should **enter the appropriate registration/setup flow** rather than bypassing it.
+
+## 9.2 Same email, different login method
+
+Suppose a user registered with `mohan@example.com` and a password, then chooses Google with the same email.
+
+**Do not automatically link** the Google identity based only on matching email text. Require the relevant provider verification and proof of control over the existing account. A secure option is for the user to sign in to the existing account and **explicitly link Google from settings**.
+
+## 9.3 Linking and unlinking
+
+**When linking an identity:**
+
+- Require an authenticated session.
+- Require **recent authentication** or reauthentication for sensitive changes.
+- Verify the Google identity **server-side**.
+- Enforce unique `(provider, provider_subject)` in PostgreSQL.
+- Ensure the provider identity is **not already linked** to another user.
+- Record a **security audit event**.
+
+**When unlinking:**
+
+- Verify that another valid login or recovery method remains.
+- **Do not allow** a user to remove the only authentication method and become permanently locked out.
+- Notify the user of the security change.
+- Revoke or review relevant sessions if warranted.
+
+**Official documentation:** Spring Security OAuth2 Login and Google OpenID Connect.
+
+---
+
+# 10. Profile creation and username policy
+
+The profile module is separate from authentication, but **account activation depends on the initial username**.
+
+## 10.1 Initial username selection
+
+**Recommended rules:**
+
+- Length: 3–30 characters.
+- Allowed characters: lowercase ASCII letters, digits, and underscore.
+- Normalize consistently before uniqueness checks.
+- Reserve prohibited words such as system route names.
+- Apply rate limits to availability checks.
+- Avoid revealing unnecessary account information through username search.
+- Enforce uniqueness with a **database constraint**.
+
+**Example valid usernames:**
+
+```
+mohan_dev
+mohan2026
+mohan_kumar
+```
+
+**Example invalid usernames:**
+
+```
+mo            # Too short under this policy
+Mohan Dev     # Spaces and uppercase rejected by normalization policy
+mohan@dev     # Unsupported character
+```
+
+The backend can normalize case to lowercase rather than rejecting uppercase input, but it must apply the **same normalization** when checking availability and saving the username.
+
+## 10.2 Changing the username every 30 days
+
+Store the time of the last successful username change. Enforce the policy in the service layer **and** the database transaction.
+
+**Pseudocode:**
+
+```java
+changeUsername(userId, requestedUsername):
+    user = loadCurrentUser(userId)
+    profile = loadProfile(userId)
+
+    normalized = normalizeAndValidate(requestedUsername)
+
+    if normalized equals profile.username:
+        return unchanged result
+
+    if profile.usernameChangedAt is not null
+       and now < profile.usernameChangedAt + 30 days:
+        reject with USERNAME_CHANGE_COOLDOWN
+
+    atomically claim normalized username
+    update profile.username
+    update profile.usernameChangedAt = now
+
+    return updated profile
+```
+
+A production implementation **must** handle concurrent requests. If two requests attempt to claim the same username, the **unique database constraint** decides which one succeeds.
+
+**Return a structured error:**
+
+```json
+{
+  "code": "USERNAME_CHANGE_COOLDOWN",
+  "message": "Your username cannot be changed yet.",
+  "nextAllowedAt": "2026-11-15T12:00:00Z"
+}
+```
+
+For the first username assignment, `usernameChangedAt` should be initialized according to your defined policy. If the 30-day cooldown starts after the initial choice, **set it when that first username is successfully assigned**.
+
+## 10.3 Optional avatar and bio
+
+Profile completion should be **idempotent**. A user may save the bio and later add an avatar, or skip both and return later.
+
+**Example request:**
+
+```json
+{ "bio": "Java developer who enjoys building useful products." }
+```
+
+**Possible response:**
+
+```json
+{
+  "username": "mohan_dev",
+  "bio": "Java developer who enjoys building useful products.",
+  "avatarUrl": null,
+  "profileComplete": true
+}
+```
+
+The meaning of `profileComplete` should be defined by your product. It **should not** mean that an avatar is mandatory.
+
+For future Cloudinary integration, store the validated asset reference or public ID rather than trusting an arbitrary client-provided URL.
+
+---
+
+# 11. User blocking
+
+## 11.1 Purpose
+
+Blocking is **directional** and **independent** of account status. A user who is `ACTIVE` can block any other `ACTIVE` user. Blocks are permanent until explicitly removed.
+
+## 11.2 Rules
+
+- **Directional:** A blocks B; B is not blocked by A unless B also blocks A.
+- **Idempotent:** re-blocking returns the existing block with `200`, not `409`.
+- **Self-block is forbidden:** `blocker_user_id <> blocked_user_id` at the database level.
+- **Cannot block `DEACTIVATED` users:** `404 USER_NOT_FOUND`.
+- **Cannot block `PENDING_DELETION` users:** `404 USER_NOT_FOUND` (they are effectively gone from the active population).
+- **Blocking does not delete message history.** That's a chat-module concern. The chat module must filter messages based on block state.
+- **Blocking does not notify the blocked user** (privacy).
+- **Blocking does not reveal the blocked user's existence** if they are deleted.
+
+## 11.3 Chat module integration
+
+Design these interfaces **now** so the chat module can use them later:
+
+```java
+public interface BlockPolicy {
+    boolean isBlocked(UUID userId, UUID otherUserId);
+    Set<UUID> filterBlocked(Set<UUID> candidateIds, UUID viewerId);
+    boolean hasAnyBlock(UUID userId, UUID otherUserId);
+}
+
+public interface AccountStatusPolicy {
+    boolean canSendMessages(UUID userId);
+    boolean canReceiveMessages(UUID userId);
+}
+```
+
+The chat module will call these **before** delivering messages. **Do not** let the chat module read `user_blocks` directly — go through the block module's service.
+
+## 11.4 Rate limits
+
+| Key | Limit | TTL |
+|---|---|---|
+| `chat:rl:block:{actor-hmac}` | 100/hour | 1 hour |
+
+## 11.5 Database-level guarantees
+
+- Unique constraint `(blocker_user_id, blocked_user_id)`.
+- Self-block check constraint.
+- Cascade on user deletion.
+
+## 11.6 Auditing
+
+Record `BLOCK_CREATED` and `BLOCK_REMOVED` security audit events. **Never** log the reason field if it may contain PII.
+
+---
+
+# 12. Account deletion with 20-day recovery
+
+## 12.1 Overview
+
+A user can request account deletion. For **20 days**, the account is in `PENDING_DELETION` and can be **recovered** using a one-time token sent to the original email. After 20 days, a scheduled job **permanently deletes** the account: it is anonymized, tombstoned, and marked `DEACTIVATED`.
+
+## 12.2 Request flow
+
+**Endpoint:** `POST /api/v1/me/deletion`
+
+**Authentication:** Access token + `ACTIVE` status + password re-entry (or fresh Google ID token for Google-only accounts).
+
+**Request:**
+
+```json
+{
+  "password": "current-password",
+  "reason": "taking a break",
+  "confirm": "DELETE MY ACCOUNT"
+}
+```
+
+**Rules:**
+
+- Require **password re-entry** for local accounts.
+- Require a fresh Google ID token for Google-only accounts.
+- Require the literal `confirm` string to prevent accidental API calls.
+- **Transaction:**
+  1. Set `users.status = 'PENDING_DELETION'`.
+  2. Revoke all `user_sessions` (`revoked_at = NOW()`).
+  3. Insert `account_deletion_requests` with `recoverable_until = NOW() + 20 days`.
+  4. Generate a **recovery token** (32 random bytes, base64url), hash it with `RECOVERY_HMAC_KEY`, store the hash and expiry in the deletion request row.
+  5. Enqueue a **deletion-requested email** (with the recovery link) via the outbox.
+- Return `202 Accepted` with `recoverableUntil` and instructions.
+
+**Response:**
+
+```json
+{
+  "status": "PENDING_DELETION",
+  "recoverableUntil": "2026-11-05T12:00:00Z",
+  "message": "Your account will be permanently deleted on 2026-11-05. Sign in before then to recover it."
+}
+```
+
+## 12.3 Recovery flow
+
+**Endpoint:** `POST /api/v1/auth/deletion/recover`
+
+**Authentication:** Public, rate-limited, requires a valid recovery token.
+
+**Request:**
+
+```json
+{ "recoveryToken": "base64url-token-from-email" }
+```
+
+**Rules:**
+
+- Look up the deletion request by hashing the submitted token with `RECOVERY_HMAC_KEY` and matching the hash.
+- Verify:
+  - The request is `PENDING`.
+  - `recoverable_until > NOW()`.
+  - The stored recovery token hash matches (constant-time compare).
+  - The token has not already been consumed.
+- **Transaction:**
+  1. Set `users.status = 'ACTIVE'`.
+  2. Mark deletion request `status = 'RECOVERED'`, `completed_at = NOW()`.
+  3. Clear `recovery_token_hash`.
+  4. Insert a new `user_sessions` row (create a fresh session).
+  5. Enqueue an **account-recovered email** via the outbox.
+- Return `200 OK` with a new session (access token + refresh cookie for web).
+
+**Response:**
+
+```json
+{
+  "status": "ACTIVE",
+  "user": {
+    "id": "0b6e3f22-...",
+    "username": "mohan_dev",
+    "email": "mohan@example.com"
+  },
+  "accessToken": "<short-lived-access-token>",
+  "tokenType": "Bearer",
+  "expiresIn": 600
+}
+```
+
+> For web, set the refresh token via `Set-Cookie`, **not** in the JSON body.
+
+## 12.4 Permanent deletion scheduler
+
+Run **once per hour** (configurable) as a Spring `@Scheduled` task.
+
+**Job logic:**
+
+```
+For each account_deletion_request
+    where status = 'PENDING'
+      and recoverable_until < NOW():
+  Process in batches of ACCOUNT_DELETION_BATCH_SIZE (default 100):
+
+    In a single transaction, with SELECT ... FOR UPDATE on the request row:
+      1. Load user.
+      2. Skip if user status is not PENDING_DELETION (idempotency guard).
+      3. Insert tombstone row into deleted_user_identities
+         (HMAC email, username_normalized).
+      4. Capture the current email for the final confirmation email.
+      5. Anonymize user row:
+           - email_normalized = 'deleted-' + uuid + '@deleted.local'
+           - first_name = 'Deleted'
+           - last_name = 'User'
+           - date_of_birth = NULL
+      6. Set users.status = 'DEACTIVATED'.
+      7. Set account_deletion_requests.status = 'COMPLETED',
+         completed_at = NOW(), recovery_token_hash = NULL.
+      8. Enqueue a 'deletion-completed' email to the original email
+         via the outbox.
+```
+
+**Production notes:**
+
+- **Idempotency:** the job must be safe to run twice. Guard with `status = 'PENDING'` and a row lock (`SELECT ... FOR UPDATE`).
+- **Batch size:** process in batches with `LIMIT`, so a backlog does not lock the database.
+- **Metrics:** emit a counter for `accounts.permanently_deleted`.
+- **Do not hard-delete the `users` row immediately** if you have foreign keys from chat. Anonymize first; hard-delete in a later migration once chat retention is defined.
+- **Grace period is 20 days, not 30.** Store it as a config value: `ACCOUNT_DELETION_GRACE_DAYS=20`.
+- **Multi-instance safety:** use ShedLock or a database advisory lock to ensure only one instance runs the scheduler at a time.
+
+## 12.5 Tombstones: preventing email and username reuse
+
+When a user is permanently deleted, insert a tombstone with:
+
+- HMAC of the original email (keyed with `IDENTIFIER_HMAC_KEY_BASE64`).
+- Normalized username (optional, product decision).
+
+**Registration flow checks tombstones before allowing a new account.** If the HMAC matches an existing tombstone:
+
+- Return a **generic success** response (`202`) and send **no** email.
+- Log internally for abuse monitoring.
+- Do **not** reveal that the email was ever registered.
+
+This prevents an attacker from registering a deleted user's email and impersonating them via password reset.
+
+## 12.6 Status guard on protected endpoints
+
+Add a guard to **all** `/api/v1/me/**` endpoints:
+
+```java
+if (user.getStatus() == PENDING_DELETION) {
+    throw new AccountPendingDeletionException(user.getRecoverableUntil());
+}
+```
+
+Return **`403`** with:
+
+```json
+{
+  "code": "ACCOUNT_PENDING_DELETION",
+  "message": "This account is scheduled for deletion.",
+  "recoverableUntil": "2026-11-05T12:00:00Z",
+  "recoveryHint": "Check your email for a recovery link."
+}
+```
+
+Only `/api/v1/auth/deletion/recover` and `/api/v1/auth/deletion/status` are allowed for `PENDING_DELETION` users.
+
+## 12.7 Login and refresh behavior
+
+**Login (`POST /api/v1/auth/login`):**
+
+- Verify password **first**.
+- If password is correct and status is `PENDING_DELETION`, return `403 ACCOUNT_PENDING_DELETION`.
+- If password is incorrect, return generic `401` (no status disclosure).
+
+**Refresh (`POST /api/v1/auth/refresh`):**
+
+- Reject if user status is `PENDING_DELETION`, `SUSPENDED`, or `DEACTIVATED`.
+- The session should already be revoked, but double-check:
+
+```java
+if (!user.getStatus().canAuthenticate()) {
+    throw new AccountNotActiveException();
+}
+```
+
+## 12.8 Rate limits
+
+| Key | Limit | TTL |
+|---|---|---|
+| `chat:rl:deletion:request:{user-hmac}` | 3/day | 24 hours |
+| `chat:rl:deletion:recover:{token-hmac}` | 5/hour | 1 hour |
+| `chat:rl:deletion:status:{ip-hash}` | 20/hour | 1 hour |
+
+## 12.9 Auditing
+
+Record these security audit events:
+
+- `ACCOUNT_DELETION_REQUESTED`
+- `ACCOUNT_DELETION_RECOVERED`
+- `ACCOUNT_PERMANENTLY_DELETED`
+- `ACCOUNT_DELETION_RECOVERY_FAILED` (invalid or expired token)
+
+**Never** log the recovery token.
+
+---
+
+# 13. Security configuration and authorization rules
+
+Spring Security protects **both** the REST APIs and the OAuth flows. Authentication establishes **who** the caller is; authorization determines **what** they can do.
+
+## 13.1 Endpoint security matrix
+
+| Endpoint type | Security policy |
+|---|---|
+| Registration start and OTP send | Public + strict rate limits |
+| OTP verification | Challenge credential + attempt limits |
+| Registration completion | Verified registration challenge |
+| Login | Public + account/IP throttling |
+| Refresh | Valid refresh credential + CSRF protection for web |
+| Logout | Revoke current session; protect cookie-authenticated requests |
+| `/auth/me` | Valid access token |
+| Profile read/update | Valid access token + current-user ownership + `ACTIVE` status |
+| Username availability | Public, rate-limited |
+| Username changes | Valid access token + cooldown + database uniqueness + `ACTIVE` |
+| Google callback | OAuth state validation + secure redirect handling |
+| Identity link/unlink | Authenticated + recent verification + `ACTIVE` |
+| Password reset | Limited reset challenge, never a general access token |
+| **Blocking** | Valid access token + `ACTIVE` status |
+| **Deletion request** | Valid access token + `ACTIVE` + password re-entry |
+| **Deletion recovery** | Public + rate-limited + valid recovery token |
+| **Deletion status check** | Public + rate-limited + generic response |
+
+## 13.2 Spring Security filter chain
+
+The filter chain should:
+
+- Configure the allowed CORS origins.
+- Apply CSRF protection to cookie-authenticated operations.
+- Permit required public registration, login, and OAuth endpoints.
+- Require authentication for `/api/v1/me/**` and other protected endpoints.
+- Validate bearer access tokens.
+- Configure OAuth2 login for the web client.
+- Return consistent JSON errors for API requests.
+- Avoid exposing stack traces or internal exception details.
+- Restrict redirects after OAuth login to approved destinations.
+- **Enforce account status guards** for `PENDING_DELETION`, `SUSPENDED`, and `DEACTIVATED`.
+
+> **Do not disable CSRF globally just because the API uses JWTs.** If the browser automatically sends cookies for a protected operation, CSRF remains relevant to that operation.
+
+## 13.3 Password requirements
+
+- Use Spring Security's `PasswordEncoder`. **BCrypt** is a common choice; **Argon2id** is also a strong option when appropriately configured.
+- Never store plaintext passwords.
+- Never encrypt passwords reversibly.
+- Never log submitted passwords.
+- Verify the password on the server.
+- Apply login throttling.
+- Revoke sessions after a password change or recovery.
+- Avoid arbitrary password-expiry rules unless required by policy.
+- Consider breached-password screening and safe password-manager support.
+
+## 13.4 Security headers and transport
+
+- Use HTTPS in production, secure cookies, appropriate content security policies on the frontend, and relevant HTTP security headers.
+- Keep TLS configuration at your reverse proxy or managed edge consistent with the backend deployment.
+- If the app later supports WebSockets, use authenticated WebSocket handshakes, explicit origin restrictions, and per-message authorization. **A valid WebSocket connection must not grant unrestricted access to every conversation.**
+
+---
+
+# 14. Environment configuration and secrets
+
+Create `.env.example` in the repository and keep your actual `.env` local and **ignored by Git**.
+
+## 14.1 Suggested environment variables
+
+```properties
+# Application
+APP_NAME=chat-backend
+APP_ENV=local
+SERVER_PORT=8080
+FRONTEND_URL=http://localhost:5173
+
+# PostgreSQL
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=chat_app
+DB_USERNAME=chat_app_user
+DB_PASSWORD=replace_with_local_secret
+
+# Redis
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_USERNAME=
+REDIS_PASSWORD=
+REDIS_SSL_ENABLED=false
+REDIS_TIMEOUT_MS=2000
+
+# Access token
+JWT_ISSUER=https://api.example.com
+JWT_AUDIENCE=chat-api
+JWT_ACCESS_TOKEN_TTL_SECONDS=600
+JWT_SIGNING_KEY_BASE64=replace_with_generated_secret
+
+# Refresh session policy
+REFRESH_TOKEN_TTL_SECONDS=604800
+REFRESH_TOKEN_REMEMBER_TTL_SECONDS=2592000
+
+# Browser cookies
+COOKIE_SECURE=false
+COOKIE_SAME_SITE=Lax
+COOKIE_DOMAIN=
+COOKIE_PATH=/api/v1/auth
+
+# Brevo
+BREVO_API_KEY=replace_with_brevo_api_key
+BREVO_SENDER_EMAIL=replace_with_verified_sender
+BREVO_SENDER_NAME=Chat App
+
+# Google OAuth
+GOOGLE_CLIENT_ID=replace_with_client_id
+GOOGLE_CLIENT_SECRET=replace_with_client_secret
+GOOGLE_REDIRECT_URI=http://localhost:8080/login/oauth2/code/google
+
+# CORS
+CORS_ALLOWED_ORIGINS=http://localhost:5173
+
+# OTP
+OTP_TTL_SECONDS=300
+OTP_RESEND_COOLDOWN_SECONDS=60
+OTP_MAX_ATTEMPTS=5
+
+# Registration
+REGISTRATION_CHALLENGE_TTL_SECONDS=1200
+
+# Password reset
+PASSWORD_RESET_TTL_SECONDS=600
+
+# Username policy
+USERNAME_CHANGE_COOLDOWN_DAYS=30
+
+# Account deletion
+ACCOUNT_DELETION_GRACE_DAYS=20
+ACCOUNT_DELETION_BATCH_SIZE=100
+ACCOUNT_DELETION_SCHEDULER_CRON=0 0 * * * *
+
+# Blocking
+BLOCK_MAX_PER_HOUR=100
+
+# Recovery token
+DELETION_RECOVERY_TOKEN_TTL_SECONDS=1728000
+DELETION_RECOVERY_HMAC_KEY_BASE64=replace_with_separate_key
+
+# Field encryption / lookup
+FIELD_ENCRYPTION_KEY_BASE64=replace_with_separate_key
+IDENTIFIER_HMAC_KEY_BASE64=replace_with_separate_key
+OTP_HMAC_KEY_BASE64=replace_with_separate_key
+```
+
+> **Critical:** `DELETION_RECOVERY_HMAC_KEY_BASE64` must be a **separate** secret from JWT, OTP HMAC, identifier HMAC, and field encryption keys.
+
+The values above are **configuration examples, not production credentials**. Generate independent cryptographically random secrets and store production values in a secret manager or secure deployment environment.
+
+For local development, configure your IDE, Docker Compose, or a compatible dotenv loader to provide the variables. Spring Boot supports externalized configuration through environment variables and configuration files; a plain `.env` file is **not** automatically loaded in every setup.
+
+## 14.2 Suggested application configuration
+
+```yaml
+spring:
+  application:
+    name: ${APP_NAME:chat-backend}
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:chat_app}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      username: ${REDIS_USERNAME:}
+      password: ${REDIS_PASSWORD:}
+      ssl:
+        enabled: ${REDIS_SSL_ENABLED:false}
+      timeout: ${REDIS_TIMEOUT_MS:2000}ms
+  security:
+    oauth2:
+      client:
+        registration:
+          google:
+            client-id: ${GOOGLE_CLIENT_ID}
+            client-secret: ${GOOGLE_CLIENT_SECRET}
+            scope:
+              - openid
+              - profile
+              - email
+```
+
+Treat this as a starting configuration, **not a complete** application configuration. You still need to bind custom properties to typed Java configuration classes, configure your JWT decoder/encoder, define CORS and CSRF, and configure the Brevo adapter.
+
+Use `ddl-auto: validate` with Flyway-controlled migrations. **Avoid automatic schema updates in production.**
+
+## 14.3 Generate secrets correctly
+
+- Generate a **separate random value** for each secret using a cryptographically secure tool or secret manager.
+- Don't use a UUID, your email, a project name, or a hardcoded password as a signing key.
+- A symmetric JWT key must satisfy the chosen algorithm's key requirements.
+- If you choose asymmetric signing, keep the private key server-side and use the corresponding public key for verification.
+- For field encryption, use a maintained authenticated-encryption implementation and a defined key-rotation strategy. **Don't implement encryption algorithms yourself.**
+- For HMAC keys (OTP, identifier, recovery token), use at least 32 random bytes, base64-encoded.
+
+---
+
+# 15. API request and response examples
+
+These examples define the JSON contract your Postman collection should use. The exact DTO fields can be adjusted before implementation.
+
+## 15.1 Start registration
+
+**`POST /api/v1/auth/registrations`**
+
+```json
+{
+  "email": "mohan@example.com",
+  "dateOfBirth": "2000-05-15"
+}
+```
+
+**Response:**
+
+```json
+{
+  "registrationId": "a7c92b6f-0000-4000-8000-000000000001",
+  "status": "OTP_SENT",
+  "expiresInSeconds": 1200,
+  "nextStep": "VERIFY_EMAIL"
+}
+```
+
+The ID is illustrative. The challenge credential should be delivered separately in a **secure cookie** for the web client or returned through an appropriate secure native-client mechanism.
+
+Use a **generic** response where exposing whether an email already exists would create an account-enumeration risk.
+
+## 15.2 Verify registration OTP
+
+**`POST /api/v1/auth/registrations/{id}/otp/verify`**
+
+```json
+{ "otp": "482193" }
+```
+
+**Response:**
+
+```json
+{
+  "status": "EMAIL_VERIFIED",
+  "nextStep": "COMPLETE_REGISTRATION"
+}
+```
+
+The code above is an example only. Verification should **consume the OTP exactly once**.
+
+## 15.3 Complete registration
+
+**`POST /api/v1/auth/registrations/{id}/complete`**
+
+```json
+{
+  "firstName": "Mohan",
+  "lastName": "Kumar",
+  "password": "use-a-strong-unique-password",
+  "keepLoggedIn": true,
+  "clientType": "WEB"
+}
+```
+
+The backend validates the verified challenge, applies password rules, hashes the password, creates the account, and transitions it to `PENDING_SETUP`.
+
+**Do not accept** `emailVerified`, `status`, `role`, `userId`, or `passwordHash` from the client as authoritative values.
+
+## 15.4 Set initial username
+
+**`POST /api/v1/auth/registrations/{id}/username`**
+
+```json
+{ "username": "mohan_dev" }
+```
+
+The backend normalizes the username, validates it, claims it under a database uniqueness constraint, and updates the account's setup state.
+
+## 15.5 Finish setup without a profile picture
+
+**`POST /api/v1/auth/registrations/{id}/finish`**
+
+```json
+{ "skipOptionalProfile": true }
+```
+
+**Response (web):**
+
+```json
+{
+  "user": {
+    "id": "0b6e3f22-0000-4000-8000-000000000002",
+    "username": "mohan_dev",
+    "firstName": "Mohan",
+    "lastName": "Kumar",
+    "status": "ACTIVE",
+    "profileComplete": true
+  },
+  "accessToken": "<short-lived-access-token>",
+  "tokenType": "Bearer",
+  "expiresIn": 600
+}
+```
+
+For web, the **refresh token** should be set through `Set-Cookie`, **not** included in the JSON response. For native clients, the response can contain a refresh credential if your native-client token protocol is designed for that. **Don't blindly return every credential to every client.**
+
+## 15.6 Login
+
+**`POST /api/v1/auth/login`**
+
+```json
+{
+  "identifier": "mohan_dev",
+  "password": "use-a-strong-unique-password",
+  "keepLoggedIn": true,
+  "clientType": "WEB"
+}
+```
+
+A successful login returns an access token and sets the refresh cookie for the web client. An incomplete or suspended account should receive a response consistent with the account-state policy, without accidentally receiving unrestricted access.
+
+## 15.7 Current user
+
+**`GET /api/v1/auth/me`**
+
+```
+Authorization: Bearer <access-token>
+```
+
+**Response:**
+
+```json
+{
+  "id": "0b6e3f22-0000-4000-8000-000000000002",
+  "email": "mohan@example.com",
+  "emailVerified": true,
+  "username": "mohan_dev",
+  "status": "ACTIVE",
+  "profile": {
+    "bio": null,
+    "avatarUrl": null
+  }
+}
+```
+
+The response should contain only fields the current user is authorized to see. Avoid returning internal security data, password hashes, provider tokens, or refresh-session secrets.
+
+## 15.8 Block a user
+
+**`POST /api/v1/me/blocks`**
+
+```json
+{
+  "blockedUserId": "0b6e3f22-0000-4000-8000-000000000010",
+  "reason": "harassment"
+}
+```
+
+**Response — 201:**
+
+```json
+{
+  "id": "block-id",
+  "blockedUserId": "0b6e3f22-0000-4000-8000-000000000010",
+  "createdAt": "2026-10-16T12:00:00Z"
+}
+```
+
+**Re-block (idempotent) — 200:**
+
+```json
+{
+  "id": "block-id",
+  "blockedUserId": "0b6e3f22-0000-4000-8000-000000000010",
+  "createdAt": "2026-10-16T12:00:00Z"
+}
+```
+
+## 15.9 List blocks
+
+**`GET /api/v1/me/blocks?page=0&size=20`**
+
+**Response:**
+
+```json
+{
+  "content": [
+    {
+      "id": "block-id",
+      "blockedUserId": "0b6e3f22-0000-4000-8000-000000000010",
+      "createdAt": "2026-10-16T12:00:00Z"
+    }
+  ],
+  "page": 0,
+  "size": 20,
+  "totalElements": 1,
+  "totalPages": 1
+}
+```
+
+## 15.10 Request account deletion
+
+**`POST /api/v1/me/deletion`**
+
+```json
+{
+  "password": "current-password",
+  "reason": "taking a break",
+  "confirm": "DELETE MY ACCOUNT"
+}
+```
+
+**Response — 202:**
+
+```json
+{
+  "status": "PENDING_DELETION",
+  "recoverableUntil": "2026-11-05T12:00:00Z",
+  "message": "Your account will be permanently deleted on 2026-11-05. Sign in before then to recover it."
+}
+```
+
+## 15.11 Recover account
+
+**`POST /api/v1/auth/deletion/recover`**
+
+```json
+{ "recoveryToken": "base64url-token-from-email" }
+```
+
+**Response — 200:**
+
+```json
+{
+  "status": "ACTIVE",
+  "user": {
+    "id": "0b6e3f22-0000-4000-8000-000000000002",
+    "username": "mohan_dev",
+    "email": "mohan@example.com"
+  },
+  "accessToken": "<short-lived-access-token>",
+  "tokenType": "Bearer",
+  "expiresIn": 600
+}
+```
+
+## 15.12 Check deletion status
+
+**`POST /api/v1/auth/deletion/status`**
+
+```json
+{ "email": "mohan@example.com" }
+```
+
+**Response — 200 (generic, no account enumeration):**
+
+```json
+{ "recoverable": true }
+```
+
+or
+
+```json
+{ "recoverable": false }
+```
+
+---
+
+# 16. Standard error handling
+
+Create a **consistent error format** for all API modules. Use a global exception handler, but **don't leak** SQL errors, provider response bodies, stack traces, or internal implementation details.
+
+**Recommended response (based on RFC 9457 Problem Details):**
+
+```json
+{
+  "type": "https://api.example.com/errors/validation",
+  "title": "Validation failed",
+  "status": 400,
+  "code": "VALIDATION_ERROR",
+  "detail": "One or more fields are invalid.",
+  "traceId": "trace-id",
+  "fieldErrors": [
+    {
+      "field": "username",
+      "code": "INVALID_FORMAT",
+      "message": "Username contains unsupported characters."
+    }
+  ]
+}
+```
+
+**HTTP status mapping:**
+
+| Status | Meaning |
+|---|---|
+| `400` | Invalid request format or invalid input |
+| `401` | Missing or invalid authentication |
+| `403` | Authenticated caller lacks permission, or account status forbids the action |
+| `404` | Resource not found, when disclosure is acceptable |
+| `409` | Username conflict, block conflict, or incompatible state transition |
+| `410` | Expired challenge or deleted account (if you choose to expose this distinction) |
+| `422` | Semantically invalid request, if used consistently |
+| `429` | Rate limit exceeded |
+| `500` | Unexpected internal failure |
+| `503` | Required dependency unavailable |
+
+**Additional error codes introduced in this version:**
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `ACCOUNT_PENDING_DELETION` | 403 | Login/API blocked; account awaiting deletion |
+| `ACCOUNT_DELETED` | 410 | Permanent deletion complete (tombstone) |
+| `BLOCK_ALREADY_EXISTS` | 409 | (Only if you choose non-idempotent blocks) |
+| `BLOCK_NOT_FOUND` | 404 | Unblock target not blocked |
+| `SELF_BLOCK_FORBIDDEN` | 400 | Cannot block self |
+| `DELETION_REQUEST_EXISTS` | 409 | Active deletion request already exists |
+| `DELETION_RECOVERY_EXPIRED` | 410 | Recovery window passed |
+| `DELETION_RECOVERY_INVALID` | 401 | Bad recovery token |
+| `USERNAME_CHANGE_COOLDOWN` | 409 | Username change attempted before 30-day window ends |
+
+**Don't reveal whether an account exists** through password-reset responses. Likewise, avoid distinguishing "wrong password" from "unknown email" in login responses.
+
+For expired OTPs, you can return a challenge-expired response because the caller already has the challenge credential. Keep the response consistent with your privacy policy.
+
+---
+
+# 17. Background jobs and schedulers
+
+## 17.1 Email outbox worker
+
+**Runs:** every 30 seconds (configurable).
+
+**Logic:**
+
+```
+SELECT * FROM email_outbox
+WHERE status = 'PENDING'
+  AND attempts < MAX_ATTEMPTS
+ORDER BY created_at
+LIMIT 50
+FOR UPDATE SKIP LOCKED;
+
+For each row:
+  Try to send via Brevo.
+  On success:
+    status = 'SENT', sent_at = NOW()
+  On failure:
+    attempts += 1
+    last_error = short message
+    if attempts >= MAX_ATTEMPTS:
+      status = 'DEAD_LETTER'
+  Commit.
+```
+
+**Notes:**
+
+- `FOR UPDATE SKIP LOCKED` allows multiple worker instances.
+- **Never** log full email bodies or OTPs.
+- Retry with exponential backoff if your Brevo account supports it.
+
+## 17.2 Permanent deletion scheduler
+
+**Runs:** every hour (configurable: `ACCOUNT_DELETION_SCHEDULER_CRON`).
+
+**Logic:** see § 12.4.
+
+**Notes:**
+
+- Use ShedLock or a database advisory lock for multi-instance safety.
+- Emit metrics: `accounts.permanently_deleted`, `accounts.deletion_batch_duration`.
+- If a batch fails, log and continue with the next batch. Do **not** let one bad row block the whole job.
+
+## 17.3 Expired challenge cleanup
+
+**Runs:** every 15 minutes.
+
+**Logic:**
+
+```
+DELETE FROM otp_challenges
+WHERE expires_at < NOW() - INTERVAL '1 day';
+
+DELETE FROM registration_challenges
+WHERE expires_at < NOW() - INTERVAL '1 day'
+  AND status IN ('EXPIRED', 'COMPLETED');
+```
+
+Keep recent history for audit; only clean up rows older than the retention window.
+
+---
+
+# 18. Postman testing strategy
+
+Create a dedicated Postman environment:
+
+```
+baseUrl = http://localhost:8080
+registrationId =
+accessToken =
+sessionId =
+username = mohan_dev
+```
+
+For the web flow, **enable cookie handling** in Postman when testing refresh and logout. The browser's cookie behavior still needs separate end-to-end testing because Postman does not enforce all browser CORS and CSRF restrictions in the same way.
+
+## 18.1 Registration tests
+
+- [ ] Start registration with valid data.
+- [ ] Reject invalid date of birth.
+- [ ] Reject an ineligible age according to your policy.
+- [ ] Validate email normalization and malformed email handling.
+- [ ] Verify OTP delivery through Brevo in a test environment.
+- [ ] Reject an incorrect OTP.
+- [ ] Reject an expired OTP.
+- [ ] Reject an OTP after it has been consumed.
+- [ ] Verify resend cooldown.
+- [ ] Verify OTP attempt limits under **concurrent** requests.
+- [ ] Reject registration completion before email verification.
+- [ ] Verify duplicate registration handling.
+- [ ] Verify an abandoned registration expires.
+- [ ] Verify the account remains `PENDING_SETUP` until username setup is complete.
+- [ ] Verify that the user can skip avatar and bio.
+
+## 18.2 Username and profile tests
+
+- [ ] Accept a valid, available username.
+- [ ] Reject a duplicate username.
+- [ ] Verify normalization is consistent.
+- [ ] Test **concurrent** attempts to claim the same username.
+- [ ] Reject username changes before the 30-day deadline.
+- [ ] Allow changes after the deadline.
+- [ ] Reject unauthorized profile updates.
+- [ ] Allow profile updates when the avatar is absent.
+- [ ] Verify profile data **cannot** be modified by supplying another user's ID.
+
+## 18.3 Session and authentication tests
+
+- [ ] Login using email and password.
+- [ ] Login using username and password.
+- [ ] Reject invalid credentials with **generic** errors.
+- [ ] Verify the access token works on protected APIs.
+- [ ] Reject malformed, expired, or incorrectly signed tokens.
+- [ ] Verify refresh-token rotation.
+- [ ] Reject revoked refresh tokens.
+- [ ] Test **simultaneous** refresh requests.
+- [ ] Test refresh-token reuse detection.
+- [ ] Verify logout revokes the current session.
+- [ ] Verify logout-all revokes all active sessions.
+- [ ] Verify a password change revokes sessions.
+- [ ] Verify expired sessions cannot be refreshed.
+- [ ] Verify a native-client session works without a browser cookie.
+- [ ] Verify the browser's refresh cookie has the correct flags.
+
+## 18.4 Google and recovery tests
+
+- [ ] Verify valid Google sign-in.
+- [ ] Reject an invalid Google token.
+- [ ] Reject an expired Google token.
+- [ ] Reject a token issued for a different audience.
+- [ ] Test a first-time Google account.
+- [ ] Test Google sign-in to an already-linked identity.
+- [ ] Reject unauthorized same-email account linking.
+- [ ] Prevent the same Google subject from linking to two accounts.
+- [ ] Prevent unlinking the only usable login method.
+- [ ] Verify password-reset OTP expiration and reuse protection.
+- [ ] Verify password reset invalidates previous sessions.
+
+## 18.5 Blocking tests
+
+- [ ] Block a user → `201`.
+- [ ] Block same user again → `200` (idempotent).
+- [ ] Block self → `400 SELF_BLOCK_FORBIDDEN`.
+- [ ] Block non-existent user → `404 USER_NOT_FOUND`.
+- [ ] Block `DEACTIVATED` user → `404 USER_NOT_FOUND`.
+- [ ] Unblock → `204`.
+- [ ] Unblock non-blocked user → `404 BLOCK_NOT_FOUND`.
+- [ ] List blocks (paginated).
+- [ ] Verify blocked user cannot message blocker (chat module test later).
+- [ ] Blocking a user does **not** reveal their existence if deleted.
+
+## 18.6 Deletion tests
+
+- [ ] Request deletion with wrong password → `401`.
+- [ ] Request deletion with missing `confirm` string → `400`.
+- [ ] Request deletion successfully → `202`, sessions revoked.
+- [ ] Attempt login after deletion → `403 ACCOUNT_PENDING_DELETION`.
+- [ ] Attempt refresh after deletion → `401`.
+- [ ] Attempt profile access after deletion → `403`.
+- [ ] Recover with valid token → `200`, account `ACTIVE`.
+- [ ] Recover with expired token → `410`.
+- [ ] Recover with tampered token → `401`.
+- [ ] Re-request deletion while one is pending → `409`.
+- [ ] Manual test: set `recoverable_until` to past, run scheduler, verify tombstone + anonymization.
+- [ ] Registration with tombstoned email → generic success, no email sent.
+
+## 18.7 Redis tests
+
+- [ ] Confirm rate-limit keys expire.
+- [ ] Verify **concurrent** requests cannot bypass limits.
+- [ ] Confirm raw emails, passwords, and OTPs do **not** appear in Redis keys.
+- [ ] Verify rate limits are shared across multiple backend instances.
+- [ ] Simulate Redis unavailability.
+- [ ] Verify sensitive endpoints fail safely.
+- [ ] Test Redis restart and recovery.
+- [ ] Confirm rate-limit responses contain an appropriate retry duration.
+
+## 18.8 Concurrency tests
+
+- [ ] Two parallel deletion requests → only one succeeds, other gets `409`.
+- [ ] Two parallel recoveries → only one succeeds.
+- [ ] Two parallel refreshes with the same token → only one succeeds; reuse detected.
+- [ ] Two parallel username claims → one succeeds, one gets `409`.
+- [ ] Two parallel OTP verifications → only one succeeds.
+- [ ] Two parallel blocks of the same user → one succeeds, one idempotent `200`.
+
+---
+
+# 19. Automated testing strategy
+
+Postman is useful for manual API testing, but production readiness also requires **automated** tests.
+
+## 19.1 Test types
+
+**Use:**
+
+- **Unit tests** for password rules, username policy, token rotation, HMAC computation, normalization.
+- **Repository tests** for uniqueness constraints and migrations.
+- **Integration tests** using PostgreSQL and Redis **Testcontainers**.
+- **Security tests** for authentication and authorization.
+- **Concurrency tests** for OTP consumption, refresh rotation, username claiming, deletion requests.
+- **End-to-end tests** for browser cookies, CSRF, and Google OAuth callbacks.
+
+## 19.2 Test doubles
+
+- Use **fake email adapters** or a test email sink in automated tests. **Do not send real OTPs** during every test run.
+- Use an **in-memory Redis** or Testcontainers Redis for rate-limit tests.
+- Use a **separate test database** that Flyway migrates from scratch on every run.
+
+## 19.3 Coverage targets
+
+- **Core authentication flows:** ≥ 90% line coverage.
+- **Blocking and deletion:** ≥ 85% line coverage.
+- **Schedulers:** unit-tested with mocked clocks.
+- **Concurrency tests:** at least one per state-mutating operation.
+
+---
+
+# 20. Production-readiness checklist
+
+Use this checklist before exposing the authentication service to public users.
+
+## Identity and registration
+
+- [ ] Account states and registration transitions are defined.
+- [ ] Email verification is mandatory for local registration.
+- [ ] Username is unique and mandatory before activation.
+- [ ] Optional profile fields never block activation.
+- [ ] Registration challenges expire and cannot be reused.
+- [ ] Tombstones prevent email reuse after permanent deletion.
+
+## Tokens and sessions
+
+- [ ] Password hashing is configured and tested.
+- [ ] Refresh tokens are random, hashed at rest, and revocable.
+- [ ] Refresh rotation and replay detection are tested.
+- [ ] Logout and logout-all revoke sessions.
+- [ ] Web and native credential storage are separate and documented.
+
+## Security controls
+
+- [ ] CSRF and CORS are configured correctly.
+- [ ] Google identity validation is server-side.
+- [ ] OTP and login rate limits are enabled.
+- [ ] Secrets are outside source control.
+- [ ] Sensitive values are excluded from logs.
+- [ ] Account status guards are applied to `/me/**` endpoints.
+
+## Blocking
+
+- [ ] `user_blocks` has unique constraint and self-block check.
+- [ ] Blocking is idempotent.
+- [ ] Chat module filters messages via `BlockPolicy`, not direct DB access.
+- [ ] Blocking a user does not leak their existence if they're deleted.
+
+## Deletion
+
+- [ ] `PENDING_DELETION` status added to constraint and state machine.
+- [ ] Deletion requires password re-entry (or fresh Google auth).
+- [ ] Recovery uses email-delivered one-time token, not access token.
+- [ ] Scheduler runs idempotently and is safe under concurrent execution.
+- [ ] Tombstones prevent email/username reuse.
+- [ ] Deleted users are anonymized, not hard-deleted, until chat retention is defined.
+- [ ] Recovery tokens are HMAC'd with a dedicated key.
+- [ ] Deletion request audit row is preserved for compliance.
+- [ ] `410 Gone` returned for permanently deleted accounts (if disclosed).
+
+## Data and operations
+
+- [ ] Flyway migrations run in CI and deployment.
+- [ ] Database backups and restore procedures are tested.
+- [ ] Redis failure behavior is tested.
+- [ ] Email delivery has retry and failure handling.
+- [ ] Metrics, tracing, and security audit events are configured.
+- [ ] Schedulers are safe under multi-instance deployment (ShedLock or advisory locks).
+
+## Quality assurance
+
+- [ ] API contract is documented.
+- [ ] Postman collection covers happy and failure paths.
+- [ ] Integration tests use PostgreSQL and Redis.
+- [ ] Concurrency and token-reuse tests pass.
+- [ ] Production HTTPS and cookie flags are verified.
+
+---
+
+# 21. Recommended implementation order
+
+Don't implement all of authentication in one large service. Build it **incrementally** and test each step before proceeding.
+
+## Step 1 — Project foundation
+
+Create the Spring Boot project, Maven dependencies, modular package structure, Docker Compose, PostgreSQL connection, Flyway migrations, and global error handling.
+
+## Step 2 — Registration and OTP
+
+Implement registration challenges, Redis rate limits, OTP generation and verification, Brevo integration, and expiration handling. Test all flows in Postman.
+
+## Step 3 — Account and profile creation
+
+Implement account completion, password hashing, `PENDING_SETUP`, username selection, 30-day username restrictions, and optional profile completion.
+
+## Step 4 — Login and session management
+
+Implement JWT validation, refresh-token rotation, browser cookies, native-client token handling, logout, logout-all, and active-session management.
+
+## Step 5 — Google login and recovery
+
+Implement Google OAuth/OIDC, native identity-token validation, explicit account linking, password reset, and email changes.
+
+## Step 6 — Blocking
+
+Implement `user_blocks`, block/unblock/list endpoints, idempotency, `BlockPolicy` interface, rate limits, and audit events.
+
+## Step 7 — Account deletion and recovery
+
+Implement `PENDING_DELETION` status, deletion request endpoint with password re-entry, recovery token generation and email delivery, recovery endpoint, tombstone table, permanent deletion scheduler, and account status guards on all `/me/**` endpoints.
+
+## Step 8 — Hardening and release
+
+Test concurrency, Redis failures, token replay, CSRF, CORS, account enumeration, migrations, monitoring, and recovery procedures.
+
+---
+
+# 22. Official implementation references
+
+Use these as primary references while implementing the module:
+
+1. **Spring Security** — password authentication, security filters, and authorization.
+2. **Spring Security OAuth2 Login** — browser-based Google login.
+3. **Spring Security JWT Resource Server** — JWT verification and bearer-token authentication.
+4. **Spring Boot Redis integration** — Redis configuration.
+5. **Redis rate-limiter patterns** — distributed rate limiting.
+6. **Brevo transactional email** — OTP, recovery, and welcome email delivery.
+7. **Google OpenID Connect** — Google identity validation.
+8. **OWASP Cheat Sheet Series** — authentication, password storage, session management, and CSRF security guidance.
+9. **RFC 9457 Problem Details** — standard API error format.
+10. **ShedLock** — distributed scheduler locking for multi-instance deployment.
+
+---
+
+# Final architecture decisions
+
+The authentication module follows these rules:
+
+1. **PostgreSQL is the source of truth** for accounts, identity links, refresh sessions, blocks, deletion requests, and tombstones.
+2. **Redis manages temporary state and distributed rate limits**; it does not replace durable session revocation, block state, or deletion state.
+3. **Brevo delivers OTPs, recovery links, and notifications**; your backend controls OTP and token security.
+4. **Google identities are linked by their stable provider subject**, not by email matching alone.
+5. **A username is mandatory for account activation**; avatar and bio are optional.
+6. **The username change restriction is enforced by the backend and database**, not just React.
+7. **The website uses secure refresh cookies**; native clients use secure native token storage.
+8. **Refresh tokens are rotated and revocable**, and access tokens are short-lived.
+9. **Every API derives the authenticated user from the security context** rather than trusting client-supplied user IDs.
+10. **Blocking is directional, idempotent, and permanent** until explicitly removed.
+11. **Account deletion uses a 20-day recovery window**, a one-time email-delivered recovery token, and a scheduled permanent-deletion job.
+12. **Tombstones prevent email and username reuse** after permanent deletion.
+13. **Account status guards** are applied to every `/me/**` endpoint.
+14. **Every secret is independent** — JWT signing, OTP HMAC, identifier HMAC, recovery token HMAC, and field encryption keys are all different.
+15. **Production readiness requires integration tests, concurrency tests, secure deployment configuration, and tested recovery procedures.**
+
+---
+
+**End of specification.**
+
+This document is the complete blueprint. Build it in the order described in § 21, test each step with the Postman collection in § 18, and verify the checklist in § 20 before release.

@@ -1,0 +1,91 @@
+spring:
+  application:
+    name: ${APP_NAME:chatting-application}
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:chat_app}?sslmode=${DB_SSL_MODE:require}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      username: ${REDIS_USERNAME:}
+      password: ${REDIS_PASSWORD:}
+      ssl:
+        enabled: ${REDIS_SSL_ENABLED:false}
+      timeout: ${REDIS_TIMEOUT_MS:2000}ms
+  security:
+    oauth2:
+      client:
+        registration:
+          google:
+            client-id: ${GOOGLE_CLIENT_ID:}
+            client-secret: ${GOOGLE_CLIENT_SECRET:}
+            scope:
+              - openid
+              - profile
+              - email
+            redirect-uri: ${GOOGLE_REDIRECT_URI:http://localhost:8080/login/oauth2/code/google}
+
+server:
+  port: ${SERVER_PORT:8080}
+
+app:
+  name: ${APP_NAME:chatting-application}
+  frontend-url: ${FRONTEND_URL:http://localhost:5173}
+  jwt:
+    issuer: ${JWT_ISSUER:http://localhost:8080}
+    audience: ${JWT_AUDIENCE:chat-api}
+    access-token-ttl-seconds: ${JWT_ACCESS_TOKEN_TTL_SECONDS:600}
+    signing-key-base64: ${JWT_SIGNING_KEY_BASE64:}
+  refresh-token:
+    ttl-seconds: ${REFRESH_TOKEN_TTL_SECONDS:604800}
+    remember-ttl-seconds: ${REFRESH_TOKEN_REMEMBER_TTL_SECONDS:2592000}
+  cookie:
+    secure: ${COOKIE_SECURE:false}
+    same-site: ${COOKIE_SAME_SITE:Lax}
+    domain: ${COOKIE_DOMAIN:}
+    path: ${COOKIE_PATH:/api/v1/auth}
+  brevo:
+    api-key: ${BREVO_API_KEY:}
+    sender-email: ${BREVO_SENDER_EMAIL:}
+    sender-name: ${BREVO_SENDER_NAME:Chatting Application}
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
+  otp:
+    ttl-seconds: ${OTP_TTL_SECONDS:300}
+    resend-cooldown-seconds: ${OTP_RESEND_COOLDOWN_SECONDS:60}
+    max-attempts: ${OTP_MAX_ATTEMPTS:5}
+  registration:
+    challenge-ttl-seconds: ${REGISTRATION_CHALLENGE_TTL_SECONDS:1200}
+  password-reset:
+    ttl-seconds: ${PASSWORD_RESET_TTL_SECONDS:600}
+  username-policy:
+    cooldown-days: ${USERNAME_CHANGE_COOLDOWN_DAYS:30}
+  account-deletion:
+    grace-days: ${ACCOUNT_DELETION_GRACE_DAYS:20}
+    batch-size: ${ACCOUNT_DELETION_BATCH_SIZE:100}
+    scheduler-cron: ${ACCOUNT_DELETION_SCHEDULER_CRON:0 0 * * * *}
+  block:
+    max-per-hour: ${BLOCK_MAX_PER_HOUR:100}
+  recovery-token:
+    ttl-seconds: ${DELETION_RECOVERY_TOKEN_TTL_SECONDS:1728000}
+    hmac-key-base64: ${DELETION_RECOVERY_HMAC_KEY_BASE64:}
+  keys:
+    field-encryption-base64: ${FIELD_ENCRYPTION_KEY_BASE64:}
+    identifier-hmac-base64: ${IDENTIFIER_HMAC_KEY_BASE64:}
+    otp-hmac-base64: ${OTP_HMAC_KEY_BASE64:}
+  cloudinary:
+    cloud-name: ${CLOUDINARY_CLOUD_NAME:}
+    upload-preset: ${CLOUDINARY_UPLOAD_PRESET:}
+    avatar-folder: ${CLOUDINARY_AVATAR_FOLDER:chat-app/avatars}

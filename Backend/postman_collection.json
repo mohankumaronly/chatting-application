@@ -1,0 +1,1302 @@
+{
+	"info": {
+		"_postman_id": "c1f7a0b3-4e89-4d22-9f33-7e4a1a512345",
+		"name": "Chat Application - Auth & Profile Production APIs",
+		"description": "Complete production-ready Postman collection for Authentication, Profile, Blocking, and Account Deletion with 20-Day Recovery.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8080",
+			"type": "string"
+		},
+		{
+			"key": "cloudName",
+			"value": "dppyvcdu",
+			"type": "string"
+		},
+		{
+			"key": "registrationId",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "challengeToken",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "accessToken",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "refreshToken",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "resetToken",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "recoveryToken",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "sessionId",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "targetUserId",
+			"value": "00000000-0000-0000-0000-000000000000",
+			"type": "string"
+		},
+		{
+			"key": "avatarPublicId",
+			"value": "chat-app/avatars/test-user-123",
+			"type": "string"
+		},
+		{
+			"key": "avatarUrl",
+			"value": "https://res.cloudinary.com/dppyvcdu/image/upload/v1700000000/chat-app/avatars/test-user-123.jpg",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "1. Registration & OTP",
+			"item": [
+				{
+					"name": "1.1 Start Registration",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"var jsonData = pm.response.json();",
+									"if (jsonData.registrationId) {",
+									"    pm.collectionVariables.set(\"registrationId\", jsonData.registrationId);",
+									"}",
+									"if (jsonData.challengeToken) {",
+									"    pm.collectionVariables.set(\"challengeToken\", jsonData.challengeToken);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"mohankumar@example.com\",\n  \"dateOfBirth\": \"2000-05-15\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/registrations",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"registrations"
+							]
+						}
+					}
+				},
+				{
+					"name": "1.2 Resend OTP",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-Challenge-Token",
+								"value": "{{challengeToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/registrations/{{registrationId}}/otp/resend",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"registrations",
+								"{{registrationId}}",
+								"otp",
+								"resend"
+							]
+						}
+					}
+				},
+				{
+					"name": "1.3 Verify OTP",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-Challenge-Token",
+								"value": "{{challengeToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"otp\": \"123456\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/registrations/{{registrationId}}/otp/verify",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"registrations",
+								"{{registrationId}}",
+								"otp",
+								"verify"
+							]
+						}
+					}
+				},
+				{
+					"name": "1.4 Complete Registration",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-Challenge-Token",
+								"value": "{{challengeToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"firstName\": \"Mohan\",\n  \"lastName\": \"Kumar\",\n  \"password\": \"SuperSecurePass123!\",\n  \"keepLoggedIn\": true,\n  \"clientType\": \"WEB\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/registrations/{{registrationId}}/complete",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"registrations",
+								"{{registrationId}}",
+								"complete"
+							]
+						}
+					}
+				},
+				{
+					"name": "1.5 Get Registration Status",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "X-Challenge-Token",
+								"value": "{{challengeToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/registrations/{{registrationId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"registrations",
+								"{{registrationId}}"
+							]
+						}
+					}
+				},
+				{
+					"name": "1.6 Set Initial Username",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-Challenge-Token",
+								"value": "{{challengeToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"username\": \"mohan_dev\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/registrations/{{registrationId}}/username",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"registrations",
+								"{{registrationId}}",
+								"username"
+							]
+						}
+					}
+				},
+				{
+					"name": "1.7 Finish Setup & Activate Account",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"var jsonData = pm.response.json();",
+									"if (jsonData.accessToken) {",
+									"    pm.collectionVariables.set(\"accessToken\", jsonData.accessToken);",
+									"}",
+									"if (jsonData.refreshToken) {",
+									"    pm.collectionVariables.set(\"refreshToken\", jsonData.refreshToken);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-Challenge-Token",
+								"value": "{{challengeToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"skipOptionalProfile\": true\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/registrations/{{registrationId}}/finish",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"registrations",
+								"{{registrationId}}",
+								"finish"
+							]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "2. Authentication & Sessions",
+			"item": [
+				{
+					"name": "2.1 Login",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"var jsonData = pm.response.json();",
+									"if (jsonData.accessToken) {",
+									"    pm.collectionVariables.set(\"accessToken\", jsonData.accessToken);",
+									"}",
+									"if (jsonData.refreshToken) {",
+									"    pm.collectionVariables.set(\"refreshToken\", jsonData.refreshToken);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"mohan_dev\",\n  \"password\": \"SuperSecurePass123!\",\n  \"keepLoggedIn\": true,\n  \"clientType\": \"WEB\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/login",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"login"
+							]
+						}
+					}
+				},
+				{
+					"name": "2.2 Refresh Token",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"var jsonData = pm.response.json();",
+									"if (jsonData.accessToken) {",
+									"    pm.collectionVariables.set(\"accessToken\", jsonData.accessToken);",
+									"}",
+									"if (jsonData.refreshToken) {",
+									"    pm.collectionVariables.set(\"refreshToken\", jsonData.refreshToken);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/refresh",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"refresh"
+							]
+						}
+					}
+				},
+				{
+					"name": "2.3 Get Current User (Me)",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/me",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"me"
+							]
+						}
+					}
+				},
+				{
+					"name": "2.4 List Active Sessions",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"var jsonData = pm.response.json();",
+									"if (Array.isArray(jsonData) && jsonData.length > 0) {",
+									"    pm.collectionVariables.set(\"sessionId\", jsonData[0].id);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/sessions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"sessions"
+							]
+						}
+					}
+				},
+				{
+					"name": "2.5 Revoke Specific Session",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/sessions/{{sessionId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"sessions",
+								"{{sessionId}}"
+							]
+						}
+					}
+				},
+				{
+					"name": "2.6 Logout (Current Session)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/logout",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"logout"
+							]
+						}
+					}
+				},
+				{
+					"name": "2.7 Logout All Sessions",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/logout-all",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"logout-all"
+							]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "3. Google Authentication",
+			"item": [
+				{
+					"name": "3.1 Native Google Login",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"var jsonData = pm.response.json();",
+									"if (jsonData.accessToken) {",
+									"    pm.collectionVariables.set(\"accessToken\", jsonData.accessToken);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"idToken\": \"mock_google_id_token\",\n  \"clientType\": \"WEB\",\n  \"keepLoggedIn\": true\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/google/native",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"google",
+								"native"
+							]
+						}
+					}
+				},
+				{
+					"name": "3.2 Link Google Identity",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"idToken\": \"mock_google_id_token\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/identities/google/link",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"identities",
+								"google",
+								"link"
+							]
+						}
+					}
+				},
+				{
+					"name": "3.3 Unlink Google Identity",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/identities/google",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"identities",
+								"google"
+							]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "4. Password & Email Recovery",
+			"item": [
+				{
+					"name": "4.1 Forgot Password (Send OTP)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"mohankumar@example.com\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/password/forgot",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"password",
+								"forgot"
+							]
+						}
+					}
+				},
+				{
+					"name": "4.2 Verify Reset OTP",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"var jsonData = pm.response.json();",
+									"if (jsonData.resetToken) {",
+									"    pm.collectionVariables.set(\"resetToken\", jsonData.resetToken);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"mohankumar@example.com\",\n  \"otp\": \"123456\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/password/reset/verify",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"password",
+								"reset",
+								"verify"
+							]
+						}
+					}
+				},
+				{
+					"name": "4.3 Reset Password (Set New)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"resetToken\": \"{{resetToken}}\",\n  \"newPassword\": \"NewBrandPassword123!\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/password/reset",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"password",
+								"reset"
+							]
+						}
+					}
+				},
+				{
+					"name": "4.4 Change Password (Signed In)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"currentPassword\": \"NewBrandPassword123!\",\n  \"newPassword\": \"SuperSecurePass123!\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/password/change",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"password",
+								"change"
+							]
+						}
+					}
+				},
+				{
+					"name": "4.5 Start Email Change",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"newEmail\": \"mohan.new@example.com\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/email/change",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"email",
+								"change"
+							]
+						}
+					}
+				},
+				{
+					"name": "4.6 Verify Email Change",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"newEmail\": \"mohan.new@example.com\",\n  \"otp\": \"123456\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/email/change/verify",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"email",
+								"change",
+								"verify"
+							]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "5. Profile & Username",
+			"item": [
+				{
+					"name": "5.1 Check Username Availability",
+					"request": {
+						"method": "GET",
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/username/available?username=mohan_dev",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"username",
+								"available"
+							],
+							"query": [
+								{
+									"key": "username",
+									"value": "mohan_dev"
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "5.2 Get My Profile",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/profile",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"profile"
+							]
+						}
+					}
+				},
+				{
+					"name": "5.3 Update Profile",
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"firstName\": \"Mohan\",\n  \"lastName\": \"Kumar\",\n  \"bio\": \"Passionate backend developer building production scale chatting applications.\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/profile",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"profile"
+							]
+						}
+					}
+				},
+				{
+					"name": "5.4 Update Avatar (Cloudinary)",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"avatarPublicId\": \"{{avatarPublicId}}\",\n  \"avatarUrl\": \"{{avatarUrl}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/profile/avatar",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"profile",
+								"avatar"
+							]
+						}
+					}
+				},
+				{
+					"name": "5.5 Remove Avatar",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/profile/avatar",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"profile",
+								"avatar"
+							]
+						}
+					}
+				},
+				{
+					"name": "5.6 Change Username (30-day cooldown policy)",
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"username\": \"mohan_2026\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/username",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"username"
+							]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "6. User Blocking",
+			"item": [
+				{
+					"name": "6.1 Block User",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"blockedUserId\": \"{{targetUserId}}\",\n  \"reason\": \"Spamming in groups\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/blocks",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"blocks"
+							]
+						}
+					}
+				},
+				{
+					"name": "6.2 List Blocked Users",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/blocks?page=0&size=20",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"blocks"
+							],
+							"query": [
+								{
+									"key": "page",
+									"value": "0"
+								},
+								{
+									"key": "size",
+									"value": "20"
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "6.3 Check Block Status",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/blocks/status/{{targetUserId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"blocks",
+								"status",
+								"{{targetUserId}}"
+							]
+						}
+					}
+				},
+				{
+					"name": "6.4 Unblock User",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/blocks/{{targetUserId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"blocks",
+								"{{targetUserId}}"
+							]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "7. Account Deletion & Recovery (20-Day Grace)",
+			"item": [
+				{
+					"name": "7.1 Request Account Deletion",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"password\": \"SuperSecurePass123!\",\n  \"reason\": \"Taking a break\",\n  \"confirm\": \"DELETE MY ACCOUNT\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/deletion",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"deletion"
+							]
+						}
+					}
+				},
+				{
+					"name": "7.2 Check Deletion Status (Authenticated)",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{accessToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/me/deletion",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"me",
+								"deletion"
+							]
+						}
+					}
+				},
+				{
+					"name": "7.3 Check Deletion Status by Email (Public)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"mohankumar@example.com\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/deletion/status",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"deletion",
+								"status"
+							]
+						}
+					}
+				},
+				{
+					"name": "7.4 Recover Account (Public with Recovery Token)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"var jsonData = pm.response.json();",
+									"if (jsonData.accessToken) {",
+									"    pm.collectionVariables.set(\"accessToken\", jsonData.accessToken);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"recoveryToken\": \"{{recoveryToken}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/auth/deletion/recover",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"auth",
+								"deletion",
+								"recover"
+							]
+						}
+					}
+				}
+			]
+		}
+	]
+}
