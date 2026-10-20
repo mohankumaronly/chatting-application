@@ -1,6 +1,9 @@
 package com.rockranger.chat.realtime.domain;
 
 import jakarta.persistence.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
+
 import java.time.Instant;
 import java.util.UUID;
 
@@ -20,6 +23,18 @@ public class RealtimeOutbox {
     @Column(name = "aggregate_id", nullable = false)
     private UUID aggregateId;
 
+    /**
+     * Stored as PostgreSQL {@code jsonb}.
+     *
+     * <p>{@code @JdbcTypeCode(SqlTypes.JSON)} is required so Hibernate binds this
+     * parameter as JDBC {@code OTHER} (mapped by the PostgreSQL driver to
+     * {@code jsonb}) instead of {@code VARCHAR}. Without it, PostgreSQL rejects
+     * inserts with:
+     * "column \"payload\" is of type jsonb but expression is of type character varying".
+     * {@code columnDefinition = "JSONB"} only affects DDL generation and is
+     * irrelevant at runtime because {@code ddl-auto: validate} is used.</p>
+     */
+    @JdbcTypeCode(SqlTypes.JSON)
     @Column(nullable = false, columnDefinition = "JSONB")
     private String payload;
 

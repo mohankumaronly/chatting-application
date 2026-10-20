@@ -1,6 +1,9 @@
 package com.rockranger.chat.messaging.domain;
 
 import jakarta.persistence.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
+
 import java.time.Instant;
 import java.util.UUID;
 
@@ -46,6 +49,18 @@ public class Message {
     @Column(name = "delete_scope", length = 20)
     private DeleteScope deleteScope;
 
+    /**
+     * Stored as PostgreSQL {@code jsonb}.
+     *
+     * <p>{@code @JdbcTypeCode(SqlTypes.JSON)} is required so Hibernate binds this
+     * parameter as JDBC {@code OTHER} (mapped by the PostgreSQL driver to
+     * {@code jsonb}/{@code json}) instead of {@code VARCHAR}. Without it,
+     * PostgreSQL rejects inserts with:
+     * "column \"metadata\" is of type jsonb but expression is of type character varying".
+     * {@code columnDefinition = "JSONB"} only affects DDL generation and is
+     * irrelevant at runtime because {@code ddl-auto: validate} is used.</p>
+     */
+    @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "metadata", columnDefinition = "JSONB")
     private String metadata;
 

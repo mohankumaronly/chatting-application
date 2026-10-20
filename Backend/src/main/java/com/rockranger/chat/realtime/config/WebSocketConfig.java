@@ -8,9 +8,6 @@ import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBr
 import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
 import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
 
-import java.util.Arrays;
-import java.util.List;
-
 @Configuration
 @EnableWebSocketMessageBroker
 public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
@@ -37,13 +34,14 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
                 ? allowedOriginsStr.split(",")
                 : new String[]{"http://localhost:5173"};
 
-        registry.addEndpoint("/ws")
-                .setAllowedOriginPatterns(allowedOrigins)
-                .withSockJS();
-
-        // Also register pure websocket endpoint for native clients
+        // 1. Pure WebSocket endpoint for native clients (Frontend, Hoppscotch, Postman)
         registry.addEndpoint("/ws")
                 .setAllowedOriginPatterns(allowedOrigins);
+
+        // 2. SockJS fallback endpoint (if you need it for older browsers)
+        registry.addEndpoint("/ws-sockjs")
+                .setAllowedOriginPatterns(allowedOrigins)
+                .withSockJS();
     }
 
     @Override

@@ -72,8 +72,14 @@ public class AuthChannelInterceptor implements ChannelInterceptor {
                 authHeader = accessor.getFirstNativeHeader("token");
             }
 
-            if (authHeader != null && authHeader.startsWith("Bearer ")) {
-                authHeader = authHeader.substring(7).trim();
+            if (authHeader != null) {
+                // 1. Remove ALL spaces, newlines, and control characters (protects against STOMP parser injection)
+                authHeader = authHeader.replaceAll("[\\p{Cntrl}\\s]", "");
+
+                // 2. Remove "Bearer" (case-insensitive) from the beginning if it exists
+                if (authHeader.toLowerCase().startsWith("bearer")) {
+                    authHeader = authHeader.substring(6);
+                }
             }
 
             if (authHeader != null && !authHeader.isBlank()) {

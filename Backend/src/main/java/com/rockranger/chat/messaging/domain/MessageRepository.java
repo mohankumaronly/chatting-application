@@ -26,12 +26,35 @@ public interface MessageRepository extends JpaRepository<Message, UUID> {
             Pageable pageable
     );
 
-    @Query("SELECT COUNT(m) FROM Message m WHERE m.conversationId = :conversationId AND m.senderId != :userId AND (:lastReadAt IS NULL OR m.createdAt > :lastReadAt)")
-    long countUnreadMessages(
+    @Query("SELECT COUNT(m) FROM Message m WHERE m.conversationId = :conversationId AND m.senderId != :userId")
+    long countUnreadMessagesAll(
+            @Param("conversationId") UUID conversationId,
+            @Param("userId") UUID userId
+    );
+
+    @Query("SELECT COUNT(m) FROM Message m WHERE m.conversationId = :conversationId AND m.senderId != :userId AND m.createdAt > :lastReadAt")
+    long countUnreadMessagesSince(
             @Param("conversationId") UUID conversationId,
             @Param("userId") UUID userId,
             @Param("lastReadAt") Instant lastReadAt
     );
+
+    /**
+     * Counts messages in a conversation that were not sent by the given user
+     * and were created after the user's last-read timestamp.
+     *
+     * <p>Implemented as a default method that dispatches to one of two explicit
+     * queries, instead of a single query using {@code (:lastReadAt IS NULL OR ...)}.
+     * The {@code ? IS NULL} pattern causes PostgreSQL to fail with
+     * "could not determine data type of parameter $N" when the JDBC driver
+     * binds an untyped {@code null}. Splitting into two queries avoids this
+     * entirely and lets each SQL statement use the appropriate index.</p>
+     */
+    default long countUnreadMessages(UUID conversationId, UUID userId, Instant lastReadAt) {
+        return lastReadAt == null
+                ? countUnreadMessagesAll(conversationId, userId)
+                : countUnreadMessagesSince(conversationId, userId, lastReadAt);
+    }
 
     Optional<Message> findFirstByConversationIdOrderBySequenceNumberDesc(UUID conversationId);
 }
